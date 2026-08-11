@@ -105,7 +105,7 @@ impl PwpProxmoxNode {
                     if let Some(message) = body_value.get("message")
                         && let Some(message) = message.as_str()
                     {
-                        match message {
+                        match message.trim() {
                             message if message == format!("VM {vm_id} is not running") => Ok(false),
                             "QEMU guest agent is not running" => Ok(false),
                             _ => Err(error.into()),

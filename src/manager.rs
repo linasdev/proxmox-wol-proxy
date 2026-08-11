@@ -3,6 +3,7 @@ use crate::proxmox::node::PwpProxmoxNode;
 use crate::settings::PwpSettings;
 use crate::target::proxy::PwpProxyTarget;
 use actix_web::HttpRequest;
+use actix_web::http::Uri;
 use futures_util::future;
 use futures_util::future::{BoxFuture, FutureExt};
 use log::{debug, info};
@@ -143,6 +144,37 @@ impl PwpManager {
         chosen_proxy_target.ok_or_else(|| PwpError::MissingProxyTarget(target_header.to_string()))
     }
 
+    pub fn choose_proxy_uri(
+        self: Arc<Self>,
+        request: &HttpRequest,
+        proxy_target: Arc<PwpProxyTarget>,
+    ) -> Result<Option<Uri>, PwpError> {
+        self.choose_proxy_url(request, proxy_target.clone())?
+            .map(|proxy_url| {
+                if !proxy_url.has_authority() {
+                    return Err(PwpError::FailedToAssembleProxyUrl);
+                }
+
+                if !proxy_url.has_host() {
+                    return Err(PwpError::FailedToAssembleProxyUrl);
+                }
+
+                let scheme = proxy_url.scheme();
+                let authority = proxy_url.authority();
+
+                let authority_end = scheme.len() + "://".len() + authority.len();
+                let path_and_query = &proxy_url.as_str()[authority_end..];
+
+                Uri::builder()
+                    .scheme(scheme)
+                    .authority(authority)
+                    .path_and_query(path_and_query)
+                    .build()
+                    .map_err(|_| PwpError::FailedToAssembleProxyUrl)
+            })
+            .transpose()
+    }
+
     pub fn choose_proxy_url(
         self: Arc<Self>,
         request: &HttpRequest,
@@ -207,9 +239,9 @@ impl PwpManager {
         let target_vm_id = proxy_target.vm_id();
 
         let requested_vm_state_future = {
-            let mut requested_vm_state_future = self.requested_vm_state_future.lock().await;
+            let mut requested_vm_state_future_guard = self.requested_vm_state_future.lock().await;
 
-            requested_vm_state_future
+            requested_vm_state_future_guard
                 .get_or_insert_with(|| {
                     self.clone()
                         .get_requested_vm_state_future(proxy_target.clone())
@@ -218,7 +250,9 @@ impl PwpManager {
         };
 
         if requested_vm_state_future.vm_id == target_vm_id {
-            requested_vm_state_future.future.await
+            let result = requested_vm_state_future.future.await;
+            self.requested_vm_state_future.lock().await.take();
+            result
         } else {
             info!(
                 "VM '{target_vm_id}' is required for request but manager is currently starting VM '{}'",
@@ -321,8 +355,6 @@ impl PwpManager {
             }
 
             info!("VM guest agent ping succeeded");
-
-            self.requested_vm_state_future.lock().await.take();
 
             Ok(())
         }.boxed().shared();

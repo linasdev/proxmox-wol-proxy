@@ -26,6 +26,7 @@ pub enum PwpError {
     MissingProxyUrl,
     MissingOrDuplicateProxyTargetHeader,
     FailedToAssembleProxyUrl,
+    ProxyError,
     ProxmoxNodeStartTimedOut,
     ProxmoxNodeBusy,
     ProxmoxVmStartTimedOut,
@@ -64,6 +65,7 @@ impl Display for PwpError {
                 write!(fmt, "Missing or duplicate proxy target header")
             }
             PwpError::FailedToAssembleProxyUrl => write!(fmt, "Failed to assemble proxy URL"),
+            PwpError::ProxyError => write!(fmt, "Proxy error"),
             PwpError::ProxmoxNodeStartTimedOut => write!(fmt, "Proxmox node start timed out"),
             PwpError::ProxmoxNodeBusy => write!(fmt, "Proxmox node is busy"),
             PwpError::ProxmoxVmStartTimedOut => write!(fmt, "Proxmox VM start timed out"),

@@ -5,6 +5,7 @@ use log::info;
 
 pub async fn handle_request(
     request: HttpRequest,
+    payload: web::Payload,
     manager: web::Data<PwpManager>,
 ) -> Result<impl Responder, PwpError> {
     info!(
@@ -22,11 +23,10 @@ pub async fn handle_request(
         .ensure_requested_vm_state_for_target(proxy_target.clone())
         .await?;
 
-    let proxy_url = manager.choose_proxy_url(&request, proxy_target)?;
+    let proxy_uri = manager.choose_proxy_uri(&request, proxy_target.clone())?;
 
-    if let Some(proxy_url) = proxy_url {
-        // TODO: Start proxy connection
-        Ok(HttpResponse::Found().body(proxy_url.to_string()))
+    if let Some(proxy_uri) = proxy_uri {
+        proxy_target.proxy(proxy_uri, payload, request.head()).await
     } else {
         Ok(HttpResponse::NoContent().finish())
     }

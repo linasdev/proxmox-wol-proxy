@@ -1,11 +1,20 @@
+use crate::error::PwpError;
+use crate::manager::PwpManager;
+use crate::settings::PwpSettings;
+use crate::target::proxy::PROXY_TARGET_CLIENT;
 use actix_settings::{ApplySettings, BasicSettings};
 use actix_web::middleware::{Compress, Condition, Logger};
 use actix_web::{App, HttpServer, web};
+use awc::Client;
 use log::info;
-use proxmox_wol_proxy::error::PwpError;
-use proxmox_wol_proxy::manager::PwpManager;
-use proxmox_wol_proxy::service;
-use proxmox_wol_proxy::settings::PwpSettings;
+use tokio::runtime;
+
+pub mod error;
+pub mod manager;
+pub mod proxmox;
+pub mod service;
+pub mod settings;
+pub mod target;
 
 #[tokio::main]
 async fn main() -> Result<(), PwpError> {
@@ -23,6 +32,11 @@ async fn main() -> Result<(), PwpError> {
 
     HttpServer::new({
         move || {
+            PROXY_TARGET_CLIENT.with_borrow_mut(|client_option| {
+                // TODO: TLS
+                client_option.replace(Client::default());
+            });
+
             App::new()
                 .wrap(Condition::new(
                     settings.actix.enable_compression,
