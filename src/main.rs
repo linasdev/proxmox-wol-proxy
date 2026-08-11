@@ -2,12 +2,13 @@ use actix_settings::{ApplySettings, BasicSettings};
 use actix_web::middleware::{Compress, Condition, Logger};
 use actix_web::{App, HttpServer, web};
 use log::info;
+use proxmox_wol_proxy::error::PwpError;
+use proxmox_wol_proxy::manager::PwpManager;
 use proxmox_wol_proxy::service;
 use proxmox_wol_proxy::settings::PwpSettings;
-use std::io;
 
-#[actix_web::main]
-async fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), PwpError> {
     env_logger::init();
 
     let settings =
@@ -18,8 +19,9 @@ async fn main() -> io::Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
+    let manager = PwpManager::new(settings.application.clone())?;
+
     HttpServer::new({
-        let settings = settings.clone();
         move || {
             App::new()
                 .wrap(Condition::new(
@@ -27,11 +29,13 @@ async fn main() -> io::Result<()> {
                     Compress::default(),
                 ))
                 .wrap(Logger::default())
-                .app_data(web::Data::new(settings.application.clone()))
+                .app_data(web::Data::from(manager.clone()))
                 .default_service(web::to(service::handle_request))
         }
     })
-    .try_apply_settings(&settings.clone())?
+    .try_apply_settings(&settings)?
     .run()
-    .await
+    .await?;
+
+    Ok(())
 }

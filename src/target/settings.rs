@@ -5,5 +5,12 @@ use serde::Deserialize;
 pub struct PwpTargetSettings {
     pub name: String,
     pub vm_id: u32,
-    pub proxy_url: Option<String>,
+    pub default_url: Option<String>,
+
+    #[serde(default = "default_should_proxy")]
+    pub should_proxy: bool,
+}
+
+fn default_should_proxy() -> bool {
+    true
 }
