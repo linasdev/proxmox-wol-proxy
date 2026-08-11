@@ -293,7 +293,7 @@ impl PwpManager {
             if need_to_start_vm && can_start_vm {
                 self.proxmox_node.start_vm(target_vm_id).await?;
             } else if need_to_start_vm {
-                info!("VM '{target_vm_id}' needs to be started on the Proxmox node, which is already running conflicting VM(s): {running_mutually_exclusive_vm_ids:?}");
+                info!("VM '{target_vm_id}' needs to be started on the Proxmox node, which is already running (a) conflicting VM(s): {running_mutually_exclusive_vm_ids:?}");
                 return Err(PwpError::ProxmoxNodeBusy);
             }
 
