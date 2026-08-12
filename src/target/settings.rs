@@ -9,6 +9,9 @@ pub struct PwpTargetSettings {
 
     #[serde(default = "default_should_proxy")]
     pub should_proxy: bool,
+
+    #[serde(default)]
+    pub preserve_host_header: bool,
 }
 
 fn default_should_proxy() -> bool {

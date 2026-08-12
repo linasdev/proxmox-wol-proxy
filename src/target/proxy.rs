@@ -41,6 +41,7 @@ pub struct PwpProxyTarget {
     vm_id: u32,
     default_url: Option<String>,
     should_proxy: bool,
+    preserve_host_header: bool,
 }
 
 impl PwpProxyTarget {
@@ -49,6 +50,7 @@ impl PwpProxyTarget {
         let vm_id = settings.vm_id;
         let default_url = settings.default_url.clone();
         let should_proxy = settings.should_proxy;
+        let preserve_host_header = settings.preserve_host_header;
 
         if should_proxy {
             if let Some(default_url) = default_url.as_ref() {
@@ -66,6 +68,7 @@ impl PwpProxyTarget {
                 vm_id,
                 default_url,
                 should_proxy: true,
+                preserve_host_header,
             }
         } else {
             info!("Creating proxy target '{name}', will not proxy");
@@ -75,6 +78,7 @@ impl PwpProxyTarget {
                 vm_id,
                 default_url: None,
                 should_proxy: false,
+                preserve_host_header,
             }
         }
     }
@@ -104,7 +108,7 @@ impl PwpProxyTarget {
         let mut upstream_request =
             with_proxy_target_client(|client| client.request(request_head.method.clone(), proxy_uri));
         upstream_request =
-            Self::prepare_headers_for_upstream(upstream_request, request_head.headers());
+            self.prepare_headers_for_upstream(upstream_request, request_head.headers());
 
         let upstream_response = match upstream_request.send_stream(payload).await {
             Ok(upstream_response) => upstream_response,
@@ -124,18 +128,31 @@ impl PwpProxyTarget {
     }
 
     fn prepare_headers_for_upstream(
+        &self,
         mut upstream_request: ClientRequest,
         header_map: &HeaderMap,
     ) -> ClientRequest {
         let dynamic_hop_by_hop_headers = Self::extract_dynamic_hop_by_hop_headers(header_map);
 
         for (header_name, header_value) in header_map.iter() {
-            if Self::should_strip_header(header_name, &dynamic_hop_by_hop_headers) {
+            if Self::should_strip_header(header_name, &dynamic_hop_by_hop_headers, self.preserve_host_header) {
                 continue;
             }
 
             upstream_request =
                 upstream_request.insert_header((header_name.clone(), header_value.clone()));
+        }
+
+        let request_uri = upstream_request.get_uri();
+
+        if !self.preserve_host_header && let Some(host) = request_uri.host() {
+            let host_header_value = if let Some(port) = request_uri.port_u16() {
+                format!("{}:{}", host, port)
+            } else {
+                host.to_string()
+            };
+
+            upstream_request = upstream_request.insert_header((header::HOST, host_header_value))
         }
 
         upstream_request
@@ -148,7 +165,7 @@ impl PwpProxyTarget {
         let dynamic_hop_by_hop_headers = Self::extract_dynamic_hop_by_hop_headers(header_map);
 
         for (header_name, header_value) in header_map.iter() {
-            if Self::should_strip_header(header_name, &dynamic_hop_by_hop_headers) {
+            if Self::should_strip_header(header_name, &dynamic_hop_by_hop_headers, true) {
                 continue;
             }
 
@@ -180,6 +197,7 @@ impl PwpProxyTarget {
     fn should_strip_header(
         header_name: &HeaderName,
         dynamic_hop_by_hop_headers: &HashSet<HeaderName>,
+        preserve_host_header: bool,
     ) -> bool {
         // Strip HTTP/2 and HTTP/3 pseudo-headers
         if header_name.as_str().starts_with(':') {
@@ -193,6 +211,10 @@ impl PwpProxyTarget {
 
         // Strip dynamic hop-by-hop headers specified in the Connection header
         if dynamic_hop_by_hop_headers.contains(header_name) {
+            return true;
+        }
+
+        if !preserve_host_header && header_name == header::HOST {
             return true;
         }
 
