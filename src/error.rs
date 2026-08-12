@@ -22,6 +22,7 @@ pub enum PwpError {
     InvalidHeaderUrl(url::ParseError),
     InvalidMacAddress(macaddr::ParseError),
     InvalidBroadcastAddress(AddrParseError),
+    InvalidTrustedProxyAddress(AddrParseError),
     MissingProxyTargetUrlHost,
     MissingProxyUrl,
     MissingOrDuplicateProxyTargetHeader,
@@ -30,6 +31,7 @@ pub enum PwpError {
     ProxmoxNodeStartTimedOut,
     ProxmoxNodeBusy,
     ProxmoxVmStartTimedOut,
+    AccessDenied,
 }
 
 impl Display for PwpError {
@@ -59,6 +61,9 @@ impl Display for PwpError {
             PwpError::InvalidBroadcastAddress(error) => {
                 write!(fmt, "Invalid broadcast address: {error}")
             }
+            PwpError::InvalidTrustedProxyAddress(error) => {
+                write!(fmt, "Invalid trusted proxy address: {error}")
+            }
             PwpError::MissingProxyTargetUrlHost => write!(fmt, "Missing proxy target URL host"),
             PwpError::MissingProxyUrl => write!(fmt, "Missing proxy URL"),
             PwpError::MissingOrDuplicateProxyTargetHeader => {
@@ -69,6 +74,7 @@ impl Display for PwpError {
             PwpError::ProxmoxNodeStartTimedOut => write!(fmt, "Proxmox node start timed out"),
             PwpError::ProxmoxNodeBusy => write!(fmt, "Proxmox node is busy"),
             PwpError::ProxmoxVmStartTimedOut => write!(fmt, "Proxmox VM start timed out"),
+            PwpError::AccessDenied => write!(fmt, "Access denied"),
         }
     }
 }
@@ -118,6 +124,9 @@ impl ResponseError for PwpError {
             PwpError::ProxmoxNodeBusy => HttpResponse::build(StatusCode::SERVICE_UNAVAILABLE)
                 .insert_header(ContentType::plaintext())
                 .body("Proxmox node is busy"),
+            PwpError::AccessDenied => HttpResponse::build(StatusCode::FORBIDDEN)
+                .insert_header(ContentType::plaintext())
+                .body("Forbidden"),
             _ => HttpResponse::build(StatusCode::INTERNAL_SERVER_ERROR)
                 .insert_header(ContentType::plaintext())
                 .body("Internal server error"),

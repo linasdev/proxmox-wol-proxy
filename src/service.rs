@@ -17,6 +17,8 @@ pub async fn handle_request(
 
     let manager = manager.into_inner();
 
+    manager.clone().authenticate(request.peer_addr())?;
+
     let proxy_target = manager.clone().choose_proxy_target(&request)?;
     manager
         .clone()

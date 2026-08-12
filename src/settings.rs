@@ -12,6 +12,9 @@ pub struct PwpSettings {
     pub broadcast_address: String,
 
     #[serde(default)]
+    pub trusted_proxy_addresses: Option<Vec<String>>,
+
+    #[serde(default)]
     pub tls_root_certificate_path: Option<PathBuf>,
 
     #[serde(default)]

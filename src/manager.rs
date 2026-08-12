@@ -7,6 +7,8 @@ use actix_web::http::Uri;
 use futures_util::future;
 use futures_util::future::{BoxFuture, FutureExt};
 use log::{debug, info};
+use std::net::{AddrParseError, IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
 use tokio::sync::Mutex;
@@ -24,6 +26,7 @@ pub struct PwpManager {
     proxy_targets: Vec<Arc<PwpProxyTarget>>,
     requested_vm_state_future: Arc<Mutex<Option<PwpRequestedVmStateFuture<'static>>>>,
 
+    trusted_proxy_addresses: Option<Vec<IpAddr>>,
     mutually_exclusive_vm_ids: Vec<u32>,
     reachability_check_delay_duration: Duration,
     guest_agent_ping_delay_duration: Duration,
@@ -45,6 +48,18 @@ impl PwpManager {
             .map(Arc::new)
             .collect::<Vec<_>>();
         let requested_vm_state_future = Arc::new(Mutex::new(None));
+
+        let trusted_proxy_addresses = settings
+            .trusted_proxy_addresses
+            .map(|trusted_proxy_addresses| {
+                trusted_proxy_addresses
+                    .iter()
+                    .map(String::as_str)
+                    .map(IpAddr::from_str)
+                    .collect::<Result<Vec<_>, AddrParseError>>()
+            })
+            .transpose()
+            .map_err(PwpError::InvalidTrustedProxyAddress)?;
 
         let mutually_exclusive_vm_ids = settings.mutually_exclusive_vm_ids;
         let reachability_check_delay_duration =
@@ -81,6 +96,7 @@ impl PwpManager {
             proxmox_node,
             proxy_targets,
             requested_vm_state_future,
+            trusted_proxy_addresses,
             mutually_exclusive_vm_ids,
             reachability_check_delay_duration,
             guest_agent_ping_delay_duration,
@@ -88,6 +104,20 @@ impl PwpManager {
             wake_on_lan_every_duration,
             wake_on_lan_attempts,
         }))
+    }
+
+    pub fn authenticate(self: Arc<Self>, peer_address: Option<SocketAddr>) -> Result<(), PwpError> {
+        if let Some(trusted_proxy_addresses) = self.trusted_proxy_addresses.as_ref() {
+            if let Some(peer_address) = peer_address
+                && trusted_proxy_addresses.contains(&peer_address.ip())
+            {
+                Ok(())
+            } else {
+                Err(PwpError::AccessDenied)
+            }
+        } else {
+            Ok(())
+        }
     }
 
     pub fn choose_proxy_target(

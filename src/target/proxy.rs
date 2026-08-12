@@ -105,8 +105,9 @@ impl PwpProxyTarget {
         payload: web::Payload,
         request_head: &RequestHead,
     ) -> Result<HttpResponse, PwpError> {
-        let mut upstream_request =
-            with_proxy_target_client(|client| client.request(request_head.method.clone(), proxy_uri));
+        let mut upstream_request = with_proxy_target_client(|client| {
+            client.request(request_head.method.clone(), proxy_uri)
+        });
         upstream_request =
             self.prepare_headers_for_upstream(upstream_request, request_head.headers());
 
@@ -135,7 +136,11 @@ impl PwpProxyTarget {
         let dynamic_hop_by_hop_headers = Self::extract_dynamic_hop_by_hop_headers(header_map);
 
         for (header_name, header_value) in header_map.iter() {
-            if Self::should_strip_header(header_name, &dynamic_hop_by_hop_headers, self.preserve_host_header) {
+            if Self::should_strip_header(
+                header_name,
+                &dynamic_hop_by_hop_headers,
+                self.preserve_host_header,
+            ) {
                 continue;
             }
 
@@ -145,7 +150,9 @@ impl PwpProxyTarget {
 
         let request_uri = upstream_request.get_uri();
 
-        if !self.preserve_host_header && let Some(host) = request_uri.host() {
+        if !self.preserve_host_header
+            && let Some(host) = request_uri.host()
+        {
             let host_header_value = if let Some(port) = request_uri.port_u16() {
                 format!("{}:{}", host, port)
             } else {
