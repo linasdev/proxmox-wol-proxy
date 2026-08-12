@@ -102,7 +102,7 @@ impl PwpProxyTarget {
         request_head: &RequestHead,
     ) -> Result<HttpResponse, PwpError> {
         let mut upstream_request =
-            with_proxy_target_client(|client| client.request_from(proxy_uri, request_head));
+            with_proxy_target_client(|client| client.request(request_head.method.clone(), proxy_uri));
         upstream_request =
             Self::prepare_headers_for_upstream(upstream_request, request_head.headers());
 
