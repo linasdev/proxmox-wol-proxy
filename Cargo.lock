@@ -150,7 +150,10 @@ dependencies = [
  "http 1.5.0",
  "impl-more 0.1.9",
  "pin-project-lite",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
 ]
@@ -333,6 +336,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rand 0.9.5",
+ "rustls",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -1537,6 +1541,8 @@ dependencies = [
  "log",
  "macaddr",
  "proxmox-client",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tokio",
@@ -1831,6 +1837,15 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

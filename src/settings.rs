@@ -1,6 +1,7 @@
 use crate::proxmox::settings::PwpProxmoxSettings;
 use crate::target::settings::PwpTargetSettings;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
@@ -9,6 +10,15 @@ pub struct PwpSettings {
     pub targets: Vec<PwpTargetSettings>,
     pub mac_address: String,
     pub broadcast_address: String,
+
+    #[serde(default)]
+    pub tls_root_certificate_path: Option<PathBuf>,
+
+    #[serde(default)]
+    pub proxy_client_timeout_ms: Option<u64>,
+
+    #[serde(default)]
+    pub proxy_client_connect_timeout_ms: Option<u64>,
 
     #[serde(default)]
     pub mutually_exclusive_vm_ids: Vec<u32>,
