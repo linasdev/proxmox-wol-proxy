@@ -1,7 +1,7 @@
 use crate::error::PwpError;
 use crate::manager::PwpManager;
 use crate::settings::PwpSettings;
-use crate::target::proxy::PROXY_TARGET_CLIENT;
+use crate::target::PROXY_TARGET_CLIENT;
 use actix_settings::{ApplySettings, BasicSettings};
 use actix_web::middleware::{Compress, Condition, Logger};
 use actix_web::{App, HttpServer, web};
@@ -33,27 +33,26 @@ async fn main() -> Result<(), PwpError> {
 
     let manager = PwpManager::new(settings.application.clone())?;
 
-    let proxy_target_client_config: Option<Arc<ClientConfig>> = if let Some(root_certificate_path) =
-        settings.application.tls_root_certificate_path.as_ref()
-    {
-        let root_certificate_store = load_root_certificate_store(root_certificate_path)?;
+    let client_settings = settings.application.client.clone();
 
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(root_certificate_store)
-            .with_no_client_auth();
+    let proxy_target_client_config: Option<Arc<ClientConfig>> =
+        if let Some(root_certificate_path) = client_settings.tls_root_certificate_path.as_ref() {
+            let root_certificate_store = load_root_certificate_store(root_certificate_path)?;
 
-        Some(Arc::new(client_config))
-    } else {
-        None
-    };
+            let client_config = ClientConfig::builder()
+                .with_root_certificates(root_certificate_store)
+                .with_no_client_auth();
 
-    let proxy_target_client_connect_timeout = settings
-        .application
+            Some(Arc::new(client_config))
+        } else {
+            None
+        };
+
+    let proxy_target_client_connect_timeout = client_settings
         .proxy_client_connect_timeout_ms
         .map(Duration::from_millis);
 
-    let proxy_target_client_timeout = settings
-        .application
+    let proxy_target_client_timeout = client_settings
         .proxy_client_timeout_ms
         .map(Duration::from_millis);
 

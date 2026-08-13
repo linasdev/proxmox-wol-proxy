@@ -17,7 +17,9 @@ pub async fn handle_request(
 
     let manager = manager.into_inner();
 
-    manager.clone().authenticate(request.peer_addr())?;
+    let peer_address = request.peer_addr();
+
+    manager.clone().authenticate(&peer_address)?;
 
     let proxy_target = manager.clone().choose_proxy_target(&request)?;
     manager
@@ -28,7 +30,9 @@ pub async fn handle_request(
     let proxy_uri = manager.choose_proxy_uri(&request, proxy_target.clone())?;
 
     if let Some(proxy_uri) = proxy_uri {
-        proxy_target.proxy(proxy_uri, payload, request.head()).await
+        proxy_target
+            .proxy(proxy_uri, payload, request.head(), &peer_address)
+            .await
     } else {
         Ok(HttpResponse::NoContent().finish())
     }

@@ -3,6 +3,8 @@ use serde::Deserialize;
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct PwpProxmoxSettings {
+    pub mac_address: String,
+    pub broadcast_address: String,
     pub node_name: String,
     pub base_url: String,
     pub token_id: String,

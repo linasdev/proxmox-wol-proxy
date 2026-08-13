@@ -1,7 +1,7 @@
 use crate::error::PwpError;
-use crate::proxmox::node::PwpProxmoxNode;
+use crate::proxmox::PwpProxmoxNode;
 use crate::settings::PwpSettings;
-use crate::target::proxy::PwpProxyTarget;
+use crate::target::PwpProxyTarget;
 use actix_web::HttpRequest;
 use actix_web::http::Uri;
 use futures_util::future;
@@ -14,6 +14,8 @@ use tokio::select;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, interval, sleep};
 use url::Url;
+
+pub mod settings;
 
 #[derive(Clone)]
 pub struct PwpRequestedVmStateFuture<'f> {
@@ -39,15 +41,16 @@ impl PwpManager {
     pub fn new(settings: PwpSettings) -> Result<Arc<Self>, PwpError> {
         info!("Starting Proxmox Wake-on-LAN proxy manager");
 
-        let proxmox_node = PwpProxmoxNode::new(settings.clone())?;
+        let proxmox_node = PwpProxmoxNode::new(settings.proxmox)?;
         let proxy_targets = settings
             .targets
-            .clone()
             .into_iter()
             .map(PwpProxyTarget::new)
             .map(Arc::new)
             .collect::<Vec<_>>();
         let requested_vm_state_future = Arc::new(Mutex::new(None));
+
+        let settings = settings.manager;
 
         let trusted_proxy_addresses = settings
             .trusted_proxy_addresses
@@ -106,7 +109,10 @@ impl PwpManager {
         }))
     }
 
-    pub fn authenticate(self: Arc<Self>, peer_address: Option<SocketAddr>) -> Result<(), PwpError> {
+    pub fn authenticate(
+        self: Arc<Self>,
+        peer_address: &Option<SocketAddr>,
+    ) -> Result<(), PwpError> {
         if let Some(trusted_proxy_addresses) = self.trusted_proxy_addresses.as_ref() {
             if let Some(peer_address) = peer_address
                 && trusted_proxy_addresses.contains(&peer_address.ip())
