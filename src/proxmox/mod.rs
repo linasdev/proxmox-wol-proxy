@@ -6,8 +6,8 @@ use proxmox_client::ProxmoxClient;
 use serde_json::Value;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::time::Duration;
 
 pub mod settings;
 
@@ -84,6 +84,14 @@ impl PwpProxmoxNode {
         info!("Starting VM: {vm_id}");
         self.proxmox_client
             .start_vm(self.node_name.as_str(), vm_id, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn shutdown_vm(&self, vm_id: u32) -> Result<(), PwpError> {
+        info!("Shutting down VM: {vm_id}");
+        self.proxmox_client
+            .shutdown_vm(self.node_name.as_str(), vm_id, None)
             .await?;
         Ok(())
     }

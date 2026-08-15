@@ -10,7 +10,9 @@ use log::info;
 use rustls::{ClientConfig, RootCertStore};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::select;
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub mod error;
 pub mod manager;
@@ -31,7 +33,18 @@ async fn main() -> Result<(), PwpError> {
         env!("CARGO_PKG_VERSION")
     );
 
+    let cancellation_token = CancellationToken::new();
     let manager = PwpManager::new(settings.application.clone())?;
+    let vm_shutdown_handler_join_handle = tokio::spawn({
+        let manager = manager.clone();
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            select! {
+                _ = manager.handle_vm_shutdowns() => {},
+                _ = cancellation_token.cancelled() => info!("Stopping VM shutdown handler"),
+            }
+        }
+    });
 
     let client_settings = settings.application.client.clone();
 
@@ -91,6 +104,11 @@ async fn main() -> Result<(), PwpError> {
     .try_apply_settings(&settings)?
     .run()
     .await?;
+
+    cancellation_token.cancel();
+    vm_shutdown_handler_join_handle
+        .await
+        .expect("Failed to join with VM shutdown handler task");
 
     Ok(())
 }

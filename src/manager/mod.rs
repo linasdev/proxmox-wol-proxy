@@ -1,35 +1,43 @@
 use crate::error::PwpError;
+use crate::manager::active_vm::{PwpActiveVm, PwpOngoingRequestGuard};
 use crate::proxmox::PwpProxmoxNode;
 use crate::settings::PwpSettings;
 use crate::target::PwpProxyTarget;
 use actix_web::HttpRequest;
 use actix_web::http::Uri;
+use chrono::Utc;
 use futures_util::future;
-use futures_util::future::{BoxFuture, FutureExt};
-use log::{debug, info};
+use futures_util::future::{BoxFuture, FutureExt, OptionFuture, select_all};
+use log::{debug, info, warn};
+use std::collections::BTreeMap;
 use std::net::{AddrParseError, IpAddr, SocketAddr};
+use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
-use tokio::sync::Mutex;
-use tokio::time::{Duration, interval, sleep};
+use tokio::sync::{Mutex, Notify};
+use tokio::time::{Duration, Instant, interval, sleep, sleep_until};
 use url::Url;
 
+pub mod active_vm;
 pub mod settings;
 
 #[derive(Clone)]
-pub struct PwpRequestedVmStateFuture<'f> {
+pub struct PwpActiveVmFuture<'f> {
     pub vm_id: u32,
-    pub future: future::Shared<BoxFuture<'f, Result<(), PwpError>>>,
+    pub future: future::Shared<BoxFuture<'f, Result<Arc<PwpOngoingRequestGuard>, PwpError>>>,
 }
 
 pub struct PwpManager {
     proxmox_node: PwpProxmoxNode,
     proxy_targets: Vec<Arc<PwpProxyTarget>>,
-    requested_vm_state_future: Arc<Mutex<Option<PwpRequestedVmStateFuture<'static>>>>,
+    active_vm_future: Arc<Mutex<Option<PwpActiveVmFuture<'static>>>>,
+    active_vms: Arc<Mutex<BTreeMap<u32, PwpActiveVm>>>,
+    active_vm_change_notify: Notify,
 
     trusted_proxy_addresses: Option<Vec<IpAddr>>,
     mutually_exclusive_vm_ids: Vec<u32>,
+    max_idle_duration: Duration,
     reachability_check_delay_duration: Duration,
     guest_agent_ping_delay_duration: Duration,
     vm_start_timeout_duration: Duration,
@@ -48,7 +56,9 @@ impl PwpManager {
             .map(PwpProxyTarget::new)
             .map(Arc::new)
             .collect::<Vec<_>>();
-        let requested_vm_state_future = Arc::new(Mutex::new(None));
+        let active_vm_future = Arc::new(Mutex::new(None));
+        let active_vms = Arc::new(Mutex::new(BTreeMap::new()));
+        let active_vm_change_notify = Notify::new();
 
         let settings = settings.manager;
 
@@ -65,6 +75,7 @@ impl PwpManager {
             .map_err(PwpError::InvalidTrustedProxyAddress)?;
 
         let mutually_exclusive_vm_ids = settings.mutually_exclusive_vm_ids;
+        let max_idle_duration = Duration::from_secs(settings.max_idle_secs);
         let reachability_check_delay_duration =
             Duration::from_millis(settings.reachability_check_delay_ms);
         let guest_agent_ping_delay_duration =
@@ -98,9 +109,13 @@ impl PwpManager {
         Ok(Arc::new(Self {
             proxmox_node,
             proxy_targets,
-            requested_vm_state_future,
+            active_vm_future,
+            active_vms,
+            active_vm_change_notify,
+
             trusted_proxy_addresses,
             mutually_exclusive_vm_ids,
+            max_idle_duration,
             reachability_check_delay_duration,
             guest_agent_ping_delay_duration,
             vm_start_timeout_duration,
@@ -268,45 +283,112 @@ impl PwpManager {
         }
     }
 
-    pub async fn ensure_requested_vm_state_for_target(
+    pub async fn handle_vm_shutdowns(self: Arc<Self>) -> ! {
+        info!("Starting VM shutdown handler");
+
+        loop {
+            let active_vm_idle_notify_futures = self
+                .active_vms
+                .lock()
+                .await
+                .iter()
+                .map(|(active_vm_id, active_vm)| {
+                    let active_vm_id = *active_vm_id;
+                    let active_vm = active_vm.clone();
+                    async move {
+                        active_vm.idle_notify.notified().await;
+                        (active_vm_id, active_vm)
+                    }
+                    .boxed()
+                })
+                .collect::<Vec<_>>();
+
+            let next_active_vm_idle_notify_future: OptionFuture<_> =
+                if active_vm_idle_notify_futures.is_empty() {
+                    None.into()
+                } else {
+                    Some(select_all(active_vm_idle_notify_futures)).into()
+                };
+
+            let (active_vm_id, active_vm) = select! {
+                Some((active_vm_id_and_vm, _, _)) = next_active_vm_idle_notify_future => active_vm_id_and_vm,
+                _ = self.active_vm_change_notify.notified() => continue,
+            };
+
+            let after_max_idle_duration = active_vm.idle_since().add(self.max_idle_duration);
+
+            info!(
+                "Waiting until '{}' before shutting down VM: {active_vm_id}",
+                Self::format_instant(after_max_idle_duration)
+            );
+
+            select! {
+                _ = sleep_until(after_max_idle_duration) => {
+                    if let Err(error) = self.proxmox_node.shutdown_vm(active_vm_id).await {
+                        warn!("Failed to shutdown VM '{active_vm_id}': {error}");
+                    }
+
+                    self.active_vms.lock().await.remove(&active_vm_id);
+                },
+                _ = active_vm.busy_notify.notified() => {
+                    info!("Request received, cancelling VM '{active_vm_id}' shutdown");
+                    continue;
+                }
+            }
+        }
+    }
+
+    pub async fn ensure_active_vm_for_target(
         self: Arc<Self>,
         proxy_target: Arc<PwpProxyTarget>,
-    ) -> Result<(), PwpError> {
+    ) -> Result<Arc<PwpOngoingRequestGuard>, PwpError> {
         let target_vm_id = proxy_target.vm_id();
 
-        let requested_vm_state_future = {
-            let mut requested_vm_state_future_guard = self.requested_vm_state_future.lock().await;
+        let active_vm_future = {
+            let mut active_vm_future_guard = self.active_vm_future.lock().await;
 
-            requested_vm_state_future_guard
-                .get_or_insert_with(|| {
-                    self.clone()
-                        .get_requested_vm_state_future(proxy_target.clone())
-                })
+            active_vm_future_guard
+                .get_or_insert_with(|| self.clone().get_active_vm_future(proxy_target.clone()))
                 .clone()
         };
 
-        if requested_vm_state_future.vm_id == target_vm_id {
-            let result = requested_vm_state_future.future.await;
-            self.requested_vm_state_future.lock().await.take();
+        if active_vm_future.vm_id == target_vm_id {
+            let result = active_vm_future.future.await;
+            self.active_vm_future.lock().await.take();
             result
         } else {
             info!(
                 "VM '{target_vm_id}' is required for request but manager is currently starting VM '{}'",
-                requested_vm_state_future.vm_id
+                active_vm_future.vm_id
             );
             Err(PwpError::ProxmoxNodeBusy)
         }
     }
 
-    fn get_requested_vm_state_future(
+    fn get_active_vm_future(
         self: Arc<Self>,
         proxy_target: Arc<PwpProxyTarget>,
-    ) -> PwpRequestedVmStateFuture<'static> {
+    ) -> PwpActiveVmFuture<'static> {
         let target_vm_id = proxy_target.vm_id();
 
         let future = async move {
+            let (ongoing_request_guard, active_vms_changed) = {
+                let mut active_vm_guard = self.active_vms.lock().await;
+                if let Some(active_vm) = active_vm_guard.get(&target_vm_id) {
+                    (active_vm.handle_request(), false)
+                } else {
+                    let active_vm = PwpActiveVm::new(target_vm_id, false);
+                    active_vm_guard.insert(target_vm_id, active_vm.clone());
+                    (active_vm.handle_request(), true)
+                }
+            };
+
+            if active_vms_changed {
+                self.active_vm_change_notify.notify_waiters();
+            }
+
             info!(
-                "Ensuring requested VM state for proxy target: {}",
+                "Ensuring VM '{target_vm_id}' is active for proxy target: {}",
                 proxy_target.name()
             );
 
@@ -392,12 +474,25 @@ impl PwpManager {
 
             info!("VM guest agent ping succeeded");
 
-            Ok(())
+            Ok(ongoing_request_guard)
         }.boxed().shared();
 
-        PwpRequestedVmStateFuture {
+        PwpActiveVmFuture {
             vm_id: target_vm_id,
             future,
         }
+    }
+
+    fn format_instant(instant: Instant) -> String {
+        let now_instant = Instant::now();
+        let now_utc = Utc::now();
+
+        let date_time = if instant >= now_instant {
+            now_utc + chrono::Duration::from_std(instant - now_instant).unwrap()
+        } else {
+            now_utc - chrono::Duration::from_std(now_instant - instant).unwrap()
+        };
+
+        date_time.to_rfc3339()
     }
 }

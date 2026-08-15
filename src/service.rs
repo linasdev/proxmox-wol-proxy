@@ -24,7 +24,7 @@ pub async fn handle_request(
     let proxy_target = manager.clone().choose_proxy_target(&request)?;
     manager
         .clone()
-        .ensure_requested_vm_state_for_target(proxy_target.clone())
+        .ensure_active_vm_for_target(proxy_target.clone())
         .await?;
 
     let proxy_uri = manager.choose_proxy_uri(&request, proxy_target.clone())?;

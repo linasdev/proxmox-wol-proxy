@@ -9,6 +9,9 @@ pub struct PwpManagerSettings {
     #[serde(default)]
     pub mutually_exclusive_vm_ids: Vec<u32>,
 
+    #[serde(default = "default_max_idle_secs")]
+    pub max_idle_secs: u64,
+
     #[serde(default = "default_reachability_check_delay_ms")]
     pub reachability_check_delay_ms: u64,
 
@@ -23,6 +26,10 @@ pub struct PwpManagerSettings {
 
     #[serde(default = "default_wake_on_lan_attempts")]
     pub wake_on_lan_attempts: u32,
+}
+
+fn default_max_idle_secs() -> u64 {
+    300
 }
 
 fn default_reachability_check_delay_ms() -> u64 {
