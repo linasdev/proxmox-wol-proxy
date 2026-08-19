@@ -1,17 +1,14 @@
 use crate::error::PwpError;
 use crate::target::settings::PwpTargetSettings;
-use actix_web::dev::RequestHead;
-use actix_web::http::header::{HeaderMap, HeaderName};
-use actix_web::http::{Uri, header};
-use actix_web::{HttpResponse, HttpResponseBuilder, web};
-use awc::error::HeaderValue;
-use awc::{Client, ClientRequest};
+use axum::http::{HeaderMap, HeaderName, Request, Response, header, response};
+use http_body_util::BodyExt;
 use log::{info, warn};
-use std::cell::RefCell;
+use reqwest::{Body, Client, RequestBuilder};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use url::Url;
 
 pub mod settings;
 
@@ -27,18 +24,6 @@ const HOP_BY_HOP_HEADERS: LazyLock<HashSet<HeaderName>> = LazyLock::new(|| {
         HeaderName::from_static("upgrade"),
     ])
 });
-
-thread_local! {
-    pub(crate) static PROXY_TARGET_CLIENT: RefCell<Option<Client>> = RefCell::new(None);
-}
-
-fn with_proxy_target_client<R>(f: impl FnOnce(&Client) -> R) -> R {
-    PROXY_TARGET_CLIENT.with_borrow(|client| {
-        f(client
-            .as_ref()
-            .expect("Proxy target client not initialized"))
-    })
-}
 
 pub struct PwpProxyTarget {
     name: String,
@@ -105,43 +90,54 @@ impl PwpProxyTarget {
 
     pub async fn proxy(
         &self,
-        proxy_uri: Uri,
-        payload: web::Payload,
-        request_head: &RequestHead,
-        peer_address: &Option<SocketAddr>,
-    ) -> Result<HttpResponse, PwpError> {
-        let mut upstream_request = with_proxy_target_client(|client| {
-            client.request(request_head.method.clone(), proxy_uri)
-        });
-        upstream_request = self.prepare_headers_for_upstream(
-            upstream_request,
-            request_head.headers(),
+        proxy_target_client: &Client,
+        proxy_url: Url,
+        request: Request<axum::body::Body>,
+        peer_address: &SocketAddr,
+    ) -> Result<Response<axum::body::Body>, PwpError> {
+        let mut upstream_request_builder =
+            proxy_target_client.request(request.method().clone(), proxy_url.clone());
+
+        upstream_request_builder = self.prepare_headers_for_upstream(
+            upstream_request_builder,
+            proxy_url,
+            request.headers(),
             peer_address,
         );
 
-        let upstream_response = match upstream_request.send_stream(payload).await {
-            Ok(upstream_response) => upstream_response,
-            Err(error) => {
-                warn!("Failed to send request to proxy target with error: {error}");
-                return Err(PwpError::ProxyError);
-            }
-        };
+        upstream_request_builder =
+            upstream_request_builder.body(Body::wrap_stream(request.into_data_stream()));
 
-        let mut downstream_response_builder = HttpResponse::build(upstream_response.status());
-        Self::prepare_headers_for_downstream(
-            &mut downstream_response_builder,
+        let upstream_response = upstream_request_builder
+            .send()
+            .await
+            .map_err(Arc::new)
+            .map_err(PwpError::ProxyClientError)?;
+
+        let mut downstream_response_builder =
+            Response::builder().status(upstream_response.status());
+
+        downstream_response_builder = Self::prepare_headers_for_downstream(
+            downstream_response_builder,
             upstream_response.headers(),
         );
 
-        Ok(downstream_response_builder.streaming(upstream_response))
+        let downstream_response = downstream_response_builder
+            .body(axum::body::Body::from_stream(
+                upstream_response.bytes_stream(),
+            ))
+            .map_err(Arc::new)
+            .map_err(PwpError::AxumHttpError)?;
+        Ok(downstream_response)
     }
 
     fn prepare_headers_for_upstream(
         &self,
-        mut upstream_request: ClientRequest,
+        mut upstream_request_builder: RequestBuilder,
+        proxy_url: Url,
         header_map: &HeaderMap,
-        peer_address: &Option<SocketAddr>,
-    ) -> ClientRequest {
+        peer_address: &SocketAddr,
+    ) -> RequestBuilder {
         let dynamic_hop_by_hop_headers = Self::extract_dynamic_hop_by_hop_headers(header_map);
 
         for (header_name, header_value) in header_map.iter() {
@@ -153,63 +149,46 @@ impl PwpProxyTarget {
                 continue;
             }
 
-            upstream_request =
-                upstream_request.insert_header((header_name.clone(), header_value.clone()));
+            upstream_request_builder =
+                upstream_request_builder.header(header_name.clone(), header_value.clone());
         }
 
-        let request_uri = upstream_request.get_uri();
-
         if !self.preserve_host_header
-            && let Some(host) = request_uri.host()
+            && let Some(host) = proxy_url.host()
         {
-            let host_header_value = if let Some(port) = request_uri.port_u16() {
+            let host_header_value = if let Some(port) = proxy_url.port() {
                 format!("{}:{}", host, port)
             } else {
                 host.to_string()
             };
 
-            upstream_request = upstream_request.insert_header((header::HOST, host_header_value))
+            upstream_request_builder =
+                upstream_request_builder.header(header::HOST, host_header_value)
         }
 
-        if let Some(peer_address) = peer_address.as_ref() {
-            if let Some(x_forwarded_for_header_value) = upstream_request
-                .headers_mut()
-                .get_mut(header::X_FORWARDED_FOR)
-            {
-                let new_x_forwarded_for = match x_forwarded_for_header_value.to_str() {
-                    Ok(original_x_forwarded_for) => {
-                        format!("{}, {}", original_x_forwarded_for, peer_address.ip())
-                    }
-                    Err(error) => {
-                        warn!("Failed to parse 'X-Forwarded-For' header value with error: {error}");
-                        return upstream_request;
-                    }
-                };
-
-                match HeaderValue::from_str(new_x_forwarded_for.as_str()) {
-                    Ok(new_x_forwarded_for_header_value) => {
-                        *x_forwarded_for_header_value = new_x_forwarded_for_header_value;
-                    }
-                    Err(error) => {
-                        warn!(
-                            "Failed to create 'X-Forwarded-For' header value with error: {error}"
-                        );
-                        return upstream_request;
-                    }
+        if let Some(x_forwarded_for_header_value) =
+            header_map.get(HeaderName::from_static("x-forwarded-for"))
+        {
+            match x_forwarded_for_header_value.to_str() {
+                Ok(original_x_forwarded_for) => {
+                    let new_x_forwarded_for =
+                        format!("{}, {}", original_x_forwarded_for, peer_address.ip());
+                    upstream_request_builder.header("x-forwarded-for", new_x_forwarded_for)
                 }
-            } else {
-                upstream_request = upstream_request
-                    .insert_header((header::X_FORWARDED_FOR, peer_address.ip().to_string()));
+                Err(error) => {
+                    warn!("Failed to parse 'X-Forwarded-For' header value with error: {error}");
+                    upstream_request_builder
+                }
             }
+        } else {
+            upstream_request_builder.header("x-forwarded-for", peer_address.ip().to_string())
         }
-
-        upstream_request
     }
 
     fn prepare_headers_for_downstream(
-        downstream_response_builder: &mut HttpResponseBuilder,
+        mut downstream_response_builder: response::Builder,
         header_map: &HeaderMap,
-    ) {
+    ) -> response::Builder {
         let dynamic_hop_by_hop_headers = Self::extract_dynamic_hop_by_hop_headers(header_map);
 
         for (header_name, header_value) in header_map.iter() {
@@ -217,8 +196,11 @@ impl PwpProxyTarget {
                 continue;
             }
 
-            downstream_response_builder.insert_header((header_name.clone(), header_value.clone()));
+            downstream_response_builder =
+                downstream_response_builder.header(header_name.clone(), header_value.clone());
         }
+
+        downstream_response_builder
     }
 
     fn extract_dynamic_hop_by_hop_headers(header_map: &HeaderMap) -> HashSet<HeaderName> {

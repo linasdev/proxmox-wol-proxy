@@ -3,8 +3,8 @@ use crate::manager::active_vm::{PwpActiveVm, PwpOngoingRequestGuard};
 use crate::proxmox::PwpProxmoxNode;
 use crate::settings::PwpSettings;
 use crate::target::PwpProxyTarget;
-use actix_web::HttpRequest;
-use actix_web::http::Uri;
+use axum::body::Body;
+use axum::http::Request;
 use chrono::Utc;
 use futures_util::future;
 use futures_util::future::{BoxFuture, FutureExt, OptionFuture, select_all};
@@ -124,17 +124,12 @@ impl PwpManager {
         }))
     }
 
-    pub fn authenticate(
-        self: Arc<Self>,
-        peer_address: &Option<SocketAddr>,
-    ) -> Result<(), PwpError> {
+    pub fn authenticate(self: Arc<Self>, peer_address: &SocketAddr) -> Result<(), PwpError> {
         if let Some(trusted_proxy_addresses) = self.trusted_proxy_addresses.as_ref() {
-            if let Some(peer_address) = peer_address
-                && trusted_proxy_addresses.contains(&peer_address.ip())
-            {
-                Ok(())
-            } else {
+            if !trusted_proxy_addresses.contains(&peer_address.ip()) {
                 Err(PwpError::AccessDenied)
+            } else {
+                Ok(())
             }
         } else {
             Ok(())
@@ -143,12 +138,14 @@ impl PwpManager {
 
     pub fn choose_proxy_target(
         self: Arc<Self>,
-        request: &HttpRequest,
+        request: &Request<Body>,
     ) -> Result<Arc<PwpProxyTarget>, PwpError> {
         let target_headers = request
             .headers()
             .get_all("X-Proxy-Target")
+            .into_iter()
             .collect::<Vec<_>>();
+
         if target_headers.len() != 1 {
             if self.proxy_targets.len() == 1 {
                 debug!(
@@ -195,40 +192,9 @@ impl PwpManager {
         chosen_proxy_target.ok_or_else(|| PwpError::MissingProxyTarget(target_header.to_string()))
     }
 
-    pub fn choose_proxy_uri(
-        self: Arc<Self>,
-        request: &HttpRequest,
-        proxy_target: Arc<PwpProxyTarget>,
-    ) -> Result<Option<Uri>, PwpError> {
-        self.choose_proxy_url(request, proxy_target.clone())?
-            .map(|proxy_url| {
-                if !proxy_url.has_authority() {
-                    return Err(PwpError::FailedToAssembleProxyUrl);
-                }
-
-                if !proxy_url.has_host() {
-                    return Err(PwpError::FailedToAssembleProxyUrl);
-                }
-
-                let scheme = proxy_url.scheme();
-                let authority = proxy_url.authority();
-
-                let authority_end = scheme.len() + "://".len() + authority.len();
-                let path_and_query = &proxy_url.as_str()[authority_end..];
-
-                Uri::builder()
-                    .scheme(scheme)
-                    .authority(authority)
-                    .path_and_query(path_and_query)
-                    .build()
-                    .map_err(|_| PwpError::FailedToAssembleProxyUrl)
-            })
-            .transpose()
-    }
-
     pub fn choose_proxy_url(
         self: Arc<Self>,
-        request: &HttpRequest,
+        request: &Request<Body>,
         proxy_target: Arc<PwpProxyTarget>,
     ) -> Result<Option<Url>, PwpError> {
         let header_url = request
@@ -264,7 +230,8 @@ impl PwpManager {
             let target_url = Url::parse(target_url).map_err(PwpError::InvalidProxyTargetUrl)?;
 
             if let Some(host) = target_url.host_str() {
-                let mut proxy_url = request.full_url();
+                let mut proxy_url = Url::from_str(request.uri().to_string().as_str())
+                    .map_err(PwpError::InvalidRequestUrl)?;
                 proxy_url
                     .set_scheme(target_url.scheme())
                     .map_err(|_| PwpError::FailedToAssembleProxyUrl)?;
@@ -328,7 +295,12 @@ impl PwpManager {
                         warn!("Failed to shutdown VM '{active_vm_id}': {error}");
                     }
 
-                    self.active_vms.lock().await.remove(&active_vm_id);
+                    let mut active_vm_guard = self.active_vms.lock().await;
+                    active_vm_guard.remove(&active_vm_id);
+
+                    if active_vm_guard.is_empty() && let Err(error) = self.proxmox_node.shutdown().await {
+                        warn!("Failed to shutdown the Proxmox node: {error}");
+                    }
                 },
                 _ = active_vm.busy_notify.notified() => {
                     info!("Request received, cancelling VM '{active_vm_id}' shutdown");

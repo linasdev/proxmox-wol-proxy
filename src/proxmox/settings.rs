@@ -10,16 +10,20 @@ pub struct PwpProxmoxSettings {
     pub token_id: String,
     pub token_secret: String,
 
+    #[serde(default)]
+    pub certificate_fingerprint: Option<String>,
+
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
 
-    #[serde(default)]
-    pub accept_invalid_certs: bool,
-
-    #[serde(default)]
-    pub allow_insecure_http: bool,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
 }
 
 fn default_connect_timeout_ms() -> u64 {
+    500
+}
+
+fn default_timeout_ms() -> u64 {
     500
 }

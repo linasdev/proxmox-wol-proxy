@@ -1,16 +1,17 @@
 use crate::error::PwpError;
 use crate::manager::PwpManager;
 use crate::settings::PwpSettings;
-use crate::target::PROXY_TARGET_CLIENT;
-use actix_settings::{ApplySettings, BasicSettings};
-use actix_web::middleware::{Compress, Condition, Logger};
-use actix_web::{App, HttpServer, web};
-use awc::{Client, Connector};
+use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
 use log::info;
+use reqwest::Client;
 use rustls::{ClientConfig, RootCertStore};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
+use tokio::task::spawn_blocking;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -21,12 +22,25 @@ pub mod service;
 pub mod settings;
 pub mod target;
 
+#[derive(Clone)]
+pub struct PwpState {
+    pub proxy_target_client: Client,
+    pub manager: Arc<PwpManager>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), PwpError> {
     env_logger::init();
 
-    let settings =
-        BasicSettings::<PwpSettings>::parse_toml("./pwp.toml").expect("Failed to parse config");
+    let settings: PwpSettings = config::Config::builder()
+        .add_source(config::File::with_name("pwp.toml"))
+        .add_source(config::Environment::with_prefix("PWP"))
+        .build()
+        .map_err(Arc::new)
+        .map_err(PwpError::Config)?
+        .try_deserialize()
+        .map_err(Arc::new)
+        .map_err(PwpError::Config)?;
 
     info!(
         "Config loaded, starting Proxmox WoL proxy v{}",
@@ -34,7 +48,7 @@ async fn main() -> Result<(), PwpError> {
     );
 
     let cancellation_token = CancellationToken::new();
-    let manager = PwpManager::new(settings.application.clone())?;
+    let manager = PwpManager::new(settings.clone())?;
     let vm_shutdown_handler_join_handle = tokio::spawn({
         let manager = manager.clone();
         let cancellation_token = cancellation_token.clone();
@@ -46,65 +60,99 @@ async fn main() -> Result<(), PwpError> {
         }
     });
 
-    let client_settings = settings.application.client.clone();
+    let proxy_target_client = {
+        let proxy_target_client_config =
+            if let Some(root_certificate_path) = settings.client.tls_root_certificate_path {
+                let root_certificate_store =
+                    spawn_blocking(move || load_root_certificate_store(&root_certificate_path))
+                        .await
+                        .expect("Failed to spawn blocking task")?;
 
-    let proxy_target_client_config: Option<Arc<ClientConfig>> =
-        if let Some(root_certificate_path) = client_settings.tls_root_certificate_path.as_ref() {
-            let root_certificate_store = load_root_certificate_store(root_certificate_path)?;
+                let client_config = ClientConfig::builder()
+                    .with_root_certificates(root_certificate_store)
+                    .with_no_client_auth();
 
-            let client_config = ClientConfig::builder()
-                .with_root_certificates(root_certificate_store)
-                .with_no_client_auth();
+                Some(client_config)
+            } else {
+                None
+            };
 
-            Some(Arc::new(client_config))
-        } else {
-            None
-        };
+        let proxy_target_client_connect_timeout = settings
+            .client
+            .proxy_client_connect_timeout_ms
+            .map(Duration::from_millis);
 
-    let proxy_target_client_connect_timeout = client_settings
-        .proxy_client_connect_timeout_ms
-        .map(Duration::from_millis);
+        let proxy_target_client_timeout = settings
+            .client
+            .proxy_client_timeout_ms
+            .map(Duration::from_millis);
 
-    let proxy_target_client_timeout = client_settings
-        .proxy_client_timeout_ms
-        .map(Duration::from_millis);
+        let mut proxy_target_client_builder = Client::builder();
 
-    HttpServer::new({
-        move || {
-            PROXY_TARGET_CLIENT.with_borrow_mut(|client_option| {
-                let mut connector = Connector::new();
-
-                if let Some(client_config) = proxy_target_client_config.as_ref() {
-                    connector = connector.rustls_0_23(client_config.clone());
-                }
-
-                if let Some(connect_timeout) = proxy_target_client_connect_timeout {
-                    connector = connector.timeout(connect_timeout);
-                }
-
-                let mut client_builder = Client::builder().connector(connector);
-
-                if let Some(timeout) = proxy_target_client_timeout {
-                    client_builder = client_builder.timeout(timeout);
-                }
-
-                client_option.replace(client_builder.finish());
-            });
-
-            App::new()
-                .wrap(Condition::new(
-                    settings.actix.enable_compression,
-                    Compress::default(),
-                ))
-                .wrap(Logger::default())
-                .app_data(web::Data::from(manager.clone()))
-                .default_service(web::to(service::handle_request))
+        if let Some(client_config) = proxy_target_client_config {
+            proxy_target_client_builder =
+                proxy_target_client_builder.use_preconfigured_tls(client_config);
         }
-    })
-    .try_apply_settings(&settings)?
-    .run()
-    .await?;
 
+        if let Some(proxy_target_client_connect_timeout) = proxy_target_client_connect_timeout {
+            proxy_target_client_builder =
+                proxy_target_client_builder.connect_timeout(proxy_target_client_connect_timeout);
+        }
+
+        if let Some(proxy_target_client_timeout) = proxy_target_client_timeout {
+            proxy_target_client_builder =
+                proxy_target_client_builder.timeout(proxy_target_client_timeout);
+        }
+
+        proxy_target_client_builder
+            .build()
+            .map_err(Arc::new)
+            .map_err(PwpError::ProxyClientError)?
+    };
+
+    let server_future = async move {
+        let app = Router::new()
+            .fallback(service::handle_request)
+            .with_state(PwpState {
+                proxy_target_client,
+                manager,
+            });
+        let address = SocketAddr::from_str(
+            format!(
+                "{}:{}",
+                settings.server.listen_address, settings.server.listen_port
+            )
+            .as_str(),
+        )
+        .map_err(PwpError::InvalidListenAddress)?;
+
+        match (
+            settings.server.tls_certificate_chain_path,
+            settings.server.tls_private_key_path,
+        ) {
+            (Some(tls_certificate_chain_path), Some(tls_private_key_path)) => {
+                let tls_config = RustlsConfig::from_pem_chain_file(
+                    tls_certificate_chain_path,
+                    tls_private_key_path,
+                )
+                .await?;
+
+                axum_server::bind_rustls(address, tls_config)
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await?
+            }
+            (None, None) => {
+                axum_server::bind(address)
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await?
+            }
+            _ => return Err(PwpError::IncompleteServerTlsDetails),
+        }
+
+        Ok(())
+    };
+
+    server_future.await?;
     cancellation_token.cancel();
     vm_shutdown_handler_join_handle
         .await

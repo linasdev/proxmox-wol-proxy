@@ -1,23 +1,23 @@
-use crate::error::PwpError;
-use crate::manager::PwpManager;
-use actix_web::{HttpRequest, HttpResponse, Responder, web};
+use crate::PwpState;
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use log::info;
+use std::net::SocketAddr;
 
 pub async fn handle_request(
-    request: HttpRequest,
-    payload: web::Payload,
-    manager: web::Data<PwpManager>,
-) -> Result<impl Responder, PwpError> {
+    State(state): State<PwpState>,
+    ConnectInfo(peer_address): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> impl IntoResponse {
     info!(
         "Received request: {} {} {:?}",
         request.method(),
-        request.path(),
+        request.uri(),
         request.version()
     );
 
-    let manager = manager.into_inner();
-
-    let peer_address = request.peer_addr();
+    let manager = state.manager;
 
     manager.clone().authenticate(&peer_address)?;
 
@@ -27,13 +27,18 @@ pub async fn handle_request(
         .ensure_active_vm_for_target(proxy_target.clone())
         .await?;
 
-    let proxy_uri = manager.choose_proxy_uri(&request, proxy_target.clone())?;
+    let proxy_url = manager.choose_proxy_url(&request, proxy_target.clone())?;
 
-    if let Some(proxy_uri) = proxy_uri {
+    if let Some(proxy_url) = proxy_url {
         proxy_target
-            .proxy(proxy_uri, payload, request.head(), &peer_address)
+            .proxy(
+                &state.proxy_target_client,
+                proxy_url,
+                request,
+                &peer_address,
+            )
             .await
     } else {
-        Ok(HttpResponse::NoContent().finish())
+        Ok(StatusCode::NO_CONTENT.into_response())
     }
 }
