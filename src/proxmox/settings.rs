@@ -21,9 +21,9 @@ pub struct PwpProxmoxSettings {
 }
 
 fn default_connect_timeout_ms() -> u64 {
-    500
+    1000
 }
 
 fn default_timeout_ms() -> u64 {
-    500
+    5000
 }

@@ -11,7 +11,6 @@ use futures_util::future::{BoxFuture, FutureExt, OptionFuture, select_all};
 use log::{debug, info, warn};
 use std::collections::BTreeMap;
 use std::net::{AddrParseError, IpAddr, SocketAddr};
-use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::select;
@@ -37,6 +36,8 @@ pub struct PwpManager {
 
     trusted_proxy_addresses: Option<Vec<IpAddr>>,
     mutually_exclusive_vm_ids: Vec<u32>,
+    treat_non_managed_vms_as_mutually_exclusive: bool,
+    prevent_shutdown_when_non_managed_vms_active: bool,
     max_idle_duration: Duration,
     reachability_check_delay_duration: Duration,
     guest_agent_ping_delay_duration: Duration,
@@ -46,7 +47,7 @@ pub struct PwpManager {
 }
 
 impl PwpManager {
-    pub fn new(settings: PwpSettings) -> Result<Arc<Self>, PwpError> {
+    pub async fn new(settings: PwpSettings) -> Result<Arc<Self>, PwpError> {
         info!("Starting Proxmox Wake-on-LAN proxy manager");
 
         let proxmox_node = PwpProxmoxNode::new(settings.proxmox)?;
@@ -75,6 +76,10 @@ impl PwpManager {
             .map_err(PwpError::InvalidTrustedProxyAddress)?;
 
         let mutually_exclusive_vm_ids = settings.mutually_exclusive_vm_ids;
+        let treat_non_managed_vms_as_mutually_exclusive =
+            settings.treat_non_managed_vms_as_mutually_exclusive;
+        let prevent_shutdown_when_non_managed_vms_active =
+            settings.prevent_shutdown_when_non_managed_vms_active;
         let max_idle_duration = Duration::from_secs(settings.max_idle_secs);
         let reachability_check_delay_duration =
             Duration::from_millis(settings.reachability_check_delay_ms);
@@ -106,6 +111,31 @@ impl PwpManager {
             );
         }
 
+        if treat_non_managed_vms_as_mutually_exclusive {
+            info!("Will treat non-managed VMs as mutually exclusive");
+            info!("Will shutdown Proxmox node when all VMs are shut down");
+        } else {
+            info!("Will shutdown Proxmox node when all managed VMs are shut down");
+        }
+
+        let running_vm_ids = proxmox_node.get_running_vm_ids().await?.unwrap_or_default();
+        for running_vm_id in running_vm_ids.into_iter() {
+            if !proxy_targets
+                .iter()
+                .any(|proxy_target| proxy_target.vm_id() == running_vm_id)
+            {
+                info!("Proxmox node is already running non-managed VM '{running_vm_id}', ignoring");
+                continue;
+            }
+
+            info!(
+                "Proxmox node is already running managed VM '{running_vm_id}', starting shutdown timer"
+            );
+
+            let active_vm = PwpActiveVm::new(running_vm_id, true, max_idle_duration);
+            active_vms.lock().await.insert(running_vm_id, active_vm);
+        }
+
         Ok(Arc::new(Self {
             proxmox_node,
             proxy_targets,
@@ -115,6 +145,8 @@ impl PwpManager {
 
             trusted_proxy_addresses,
             mutually_exclusive_vm_ids,
+            treat_non_managed_vms_as_mutually_exclusive,
+            prevent_shutdown_when_non_managed_vms_active,
             max_idle_duration,
             reachability_check_delay_duration,
             guest_agent_ping_delay_duration,
@@ -227,21 +259,14 @@ impl PwpManager {
                 "Proxy target '{}' is configured to proxy, using URL provided in the target configuration",
                 proxy_target.name()
             );
-            let target_url = Url::parse(target_url).map_err(PwpError::InvalidProxyTargetUrl)?;
+            let mut target_url = Url::parse(target_url).map_err(PwpError::InvalidProxyTargetUrl)?;
 
-            if let Some(host) = target_url.host_str() {
-                let mut proxy_url = Url::from_str(request.uri().to_string().as_str())
-                    .map_err(PwpError::InvalidRequestUrl)?;
-                proxy_url
-                    .set_scheme(target_url.scheme())
-                    .map_err(|_| PwpError::FailedToAssembleProxyUrl)?;
-                proxy_url
-                    .set_host(Some(host))
-                    .map_err(|_| PwpError::FailedToAssembleProxyUrl)?;
-                proxy_url
-                    .set_port(target_url.port())
-                    .map_err(|_| PwpError::FailedToAssembleProxyUrl)?;
-                Ok(Some(proxy_url))
+            if let Some(_) = target_url.host_str() {
+                let request_uri = request.uri();
+                target_url.set_path(request_uri.path());
+                target_url.set_query(request_uri.query());
+
+                Ok(Some(target_url))
             } else {
                 Err(PwpError::MissingProxyTargetUrlHost)
             }
@@ -263,7 +288,7 @@ impl PwpManager {
                     let active_vm_id = *active_vm_id;
                     let active_vm = active_vm.clone();
                     async move {
-                        active_vm.idle_notify.notified().await;
+                        active_vm.idle_notify().notified().await;
                         (active_vm_id, active_vm)
                     }
                     .boxed()
@@ -282,15 +307,15 @@ impl PwpManager {
                 _ = self.active_vm_change_notify.notified() => continue,
             };
 
-            let after_max_idle_duration = active_vm.idle_since().add(self.max_idle_duration);
+            let active_vm_shutdown_at = active_vm.shutdown_at();
 
             info!(
                 "Waiting until '{}' before shutting down VM: {active_vm_id}",
-                Self::format_instant(after_max_idle_duration)
+                Self::format_instant(active_vm_shutdown_at)
             );
 
             select! {
-                _ = sleep_until(after_max_idle_duration) => {
+                _ = sleep_until(active_vm_shutdown_at) => {
                     if let Err(error) = self.proxmox_node.shutdown_vm(active_vm_id).await {
                         warn!("Failed to shutdown VM '{active_vm_id}': {error}");
                     }
@@ -298,12 +323,38 @@ impl PwpManager {
                     let mut active_vm_guard = self.active_vms.lock().await;
                     active_vm_guard.remove(&active_vm_id);
 
-                    if active_vm_guard.is_empty() && let Err(error) = self.proxmox_node.shutdown().await {
+                    if !active_vm_guard.is_empty() {
+                        continue;
+                    }
+
+                    if self.prevent_shutdown_when_non_managed_vms_active {
+                        match self.proxmox_node.get_running_vm_ids().await {
+                            Ok(Some(running_vm_ids)) if running_vm_ids.is_empty() => {}
+                            Err(error) => {
+                                warn!("Failed to get running VM ids: {error}");
+                                continue;
+                            }
+                            _ => {
+                                info!("Non-managed VMs are running, will not shutdown the Proxmox node");
+                                continue;
+                            },
+                        }
+                    }
+
+                    if let Err(error) = self.proxmox_node.shutdown().await {
                         warn!("Failed to shutdown the Proxmox node: {error}");
                     }
                 },
-                _ = active_vm.busy_notify.notified() => {
-                    info!("Request received, cancelling VM '{active_vm_id}' shutdown");
+                _ = active_vm.busy_notify().notified() => {
+                    info!("Request received, stopping VM '{active_vm_id}' shutdown timer");
+                    continue;
+                }
+                _ = self.active_vm_change_notify.notified() => {
+                    info!("Active VMs changed, stopping VM '{active_vm_id}' shutdown timer");
+
+                    // Need to restore the Notify status of the active VM, otherwise it will never shut down
+                    active_vm.idle_notify().notify_one();
+
                     continue;
                 }
             }
@@ -344,20 +395,8 @@ impl PwpManager {
         let target_vm_id = proxy_target.vm_id();
 
         let future = async move {
-            let (ongoing_request_guard, active_vms_changed) = {
-                let mut active_vm_guard = self.active_vms.lock().await;
-                if let Some(active_vm) = active_vm_guard.get(&target_vm_id) {
-                    (active_vm.handle_request(), false)
-                } else {
-                    let active_vm = PwpActiveVm::new(target_vm_id, false);
-                    active_vm_guard.insert(target_vm_id, active_vm.clone());
-                    (active_vm.handle_request(), true)
-                }
-            };
-
-            if active_vms_changed {
-                self.active_vm_change_notify.notify_waiters();
-            }
+            let ongoing_request_guard =
+                self.active_vms.lock().await.get(&target_vm_id).map(|active_vm| active_vm.handle_request());
 
             info!(
                 "Ensuring VM '{target_vm_id}' is active for proxy target: {}",
@@ -393,7 +432,21 @@ impl PwpManager {
             let running_mutually_exclusive_vm_ids = running_vm_ids
                 .iter()
                 .copied()
-                .filter(|vm_id| self.mutually_exclusive_vm_ids.contains(vm_id))
+                .filter(|vm_id| {
+                    if self.mutually_exclusive_vm_ids.contains(vm_id) {
+                        return true;
+                    }
+
+                    if !self.treat_non_managed_vms_as_mutually_exclusive {
+                        return false;
+                    }
+
+                    if self.proxy_targets.iter().any(|proxy_target| proxy_target.vm_id() == *vm_id) {
+                        return false;
+                    }
+
+                    true
+                })
                 .collect::<Vec<_>>();
 
             if running_vm_ids.is_empty() {
@@ -433,7 +486,30 @@ impl PwpManager {
 
                 while !vm_running {
                     select! {
-                        _ = &mut vm_start_timeout => return Err(PwpError::ProxmoxVmStartTimedOut),
+                        _ = &mut vm_start_timeout => {
+                            let active_vm = match self.proxmox_node.get_running_vm_ids().await? {
+                                Some(running_vm_ids) if running_vm_ids.contains(&target_vm_id) => {
+                                    info!("Failed to start VM '{target_vm_id}' but it reports as running, will try shutting it down");
+
+                                    let active_vm = {
+                                        let mut active_vm_guard = self.active_vms.lock().await;
+                                        let active_vm = PwpActiveVm::new(target_vm_id, true, Duration::ZERO);
+                                        active_vm_guard.insert(target_vm_id, active_vm.clone());
+                                        active_vm
+                                    };
+
+                                    self.active_vm_change_notify.notify_waiters();
+
+                                    Some(active_vm)
+                                }
+                                _ => {
+                                    warn!("Failed to start VM '{target_vm_id}'");
+                                    None
+                                },
+                            };
+
+                            return Err(PwpError::ProxmoxVmStartTimedOut(active_vm));
+                        },
                         _ = sleep(self.guest_agent_ping_delay_duration) => {},
                     }
 
@@ -445,6 +521,19 @@ impl PwpManager {
             }
 
             info!("VM guest agent ping succeeded");
+
+            let (ongoing_request_guard, active_vm_created) = if let Some(ongoing_request_guard) = ongoing_request_guard {
+                (ongoing_request_guard, false)
+            } else {
+                let mut active_vm_guard = self.active_vms.lock().await;
+                let active_vm = PwpActiveVm::new(target_vm_id, false, self.max_idle_duration);
+                active_vm_guard.insert(target_vm_id, active_vm.clone());
+                (active_vm.handle_request(), true)
+            };
+
+            if active_vm_created {
+                self.active_vm_change_notify.notify_waiters();
+            }
 
             Ok(ongoing_request_guard)
         }.boxed().shared();

@@ -9,6 +9,12 @@ pub struct PwpManagerSettings {
     #[serde(default)]
     pub mutually_exclusive_vm_ids: Vec<u32>,
 
+    #[serde(default = "default_treat_non_managed_vms_as_mutually_exclusive")]
+    pub treat_non_managed_vms_as_mutually_exclusive: bool,
+
+    #[serde(default = "default_prevent_shutdown_when_non_managed_vms_active")]
+    pub prevent_shutdown_when_non_managed_vms_active: bool,
+
     #[serde(default = "default_max_idle_secs")]
     pub max_idle_secs: u64,
 
@@ -26,6 +32,14 @@ pub struct PwpManagerSettings {
 
     #[serde(default = "default_wake_on_lan_attempts")]
     pub wake_on_lan_attempts: u32,
+}
+
+fn default_treat_non_managed_vms_as_mutually_exclusive() -> bool {
+    true
+}
+
+fn default_prevent_shutdown_when_non_managed_vms_active() -> bool {
+    true
 }
 
 fn default_max_idle_secs() -> u64 {

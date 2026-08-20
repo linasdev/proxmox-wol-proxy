@@ -1,3 +1,4 @@
+use crate::manager::active_vm::PwpActiveVm;
 use axum::http::StatusCode;
 use axum::http::header::ToStrError;
 use axum::response::{IntoResponse, Response};
@@ -24,22 +25,20 @@ pub enum PwpError {
     DuplicateProxyTargetName(String),
     InvalidProxyTargetUrl(url::ParseError),
     InvalidHeaderUrl(url::ParseError),
-    InvalidRequestUrl(url::ParseError),
     InvalidMacAddress(macaddr::ParseError),
     InvalidListenAddress(AddrParseError),
     InvalidBroadcastAddress(AddrParseError),
     InvalidTrustedProxyAddress(AddrParseError),
     InvalidCertificateFingerprint(hex::FromHexError),
+    ProxmoxVmStartTimedOut(Option<PwpActiveVm>),
     InvalidProxmoxAuthorizationHeader,
     IncompleteServerTlsDetails,
     FailedToLoadPrivateKey,
     MissingProxyTargetUrlHost,
     MissingProxyUrl,
     MissingOrDuplicateProxyTargetHeader,
-    FailedToAssembleProxyUrl,
     ProxmoxNodeStartTimedOut,
     ProxmoxNodeBusy,
-    ProxmoxVmStartTimedOut,
     AccessDenied,
 }
 
@@ -75,7 +74,6 @@ impl Display for PwpError {
                 write!(fmt, "Invalid proxy target URL: {error}")
             }
             PwpError::InvalidHeaderUrl(error) => write!(fmt, "Invalid header URL: {error}"),
-            PwpError::InvalidRequestUrl(error) => write!(fmt, "Invalid request URL: {error}"),
             PwpError::InvalidMacAddress(error) => write!(fmt, "Invalid MAC address: {error}"),
             PwpError::InvalidListenAddress(error) => {
                 write!(fmt, "Invalid listen address: {error}")
@@ -89,6 +87,7 @@ impl Display for PwpError {
             PwpError::InvalidCertificateFingerprint(error) => {
                 write!(fmt, "Invalid certificate fingerprint: {error}")
             }
+            PwpError::ProxmoxVmStartTimedOut(_) => write!(fmt, "Proxmox VM start timed out"),
             PwpError::InvalidProxmoxAuthorizationHeader => {
                 write!(fmt, "Invalid Proxmox authorization header")
             }
@@ -99,10 +98,8 @@ impl Display for PwpError {
             PwpError::MissingOrDuplicateProxyTargetHeader => {
                 write!(fmt, "Missing or duplicate proxy target header")
             }
-            PwpError::FailedToAssembleProxyUrl => write!(fmt, "Failed to assemble proxy URL"),
             PwpError::ProxmoxNodeStartTimedOut => write!(fmt, "Proxmox node start timed out"),
             PwpError::ProxmoxNodeBusy => write!(fmt, "Proxmox node is busy"),
-            PwpError::ProxmoxVmStartTimedOut => write!(fmt, "Proxmox VM start timed out"),
             PwpError::AccessDenied => write!(fmt, "Access denied"),
         }
     }
@@ -158,7 +155,7 @@ impl IntoResponse for PwpError {
                 StatusCode::GATEWAY_TIMEOUT,
                 "Proxmox node start timed out".to_string(),
             ),
-            PwpError::ProxmoxVmStartTimedOut => (
+            PwpError::ProxmoxVmStartTimedOut(_) => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "Proxmox VM start timed out".to_string(),
             ),

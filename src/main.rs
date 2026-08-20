@@ -48,7 +48,7 @@ async fn main() -> Result<(), PwpError> {
     );
 
     let cancellation_token = CancellationToken::new();
-    let manager = PwpManager::new(settings.clone())?;
+    let manager = PwpManager::new(settings.clone()).await?;
     let vm_shutdown_handler_join_handle = tokio::spawn({
         let manager = manager.clone();
         let cancellation_token = cancellation_token.clone();

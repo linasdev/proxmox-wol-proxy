@@ -118,8 +118,11 @@ impl PwpProxmoxNode {
                             vm.get("status").and_then(Value::as_str).and_then(|status| {
                                 if status == "running" {
                                     vm.get("id")
-                                        .and_then(Value::as_u64)
-                                        .map(|running_vm_id| running_vm_id as u32)
+                                        .and_then(Value::as_str)
+                                        .and_then(|running_vm_id| {
+                                            running_vm_id.strip_prefix("qemu/")
+                                        })
+                                        .and_then(|running_vm_id| running_vm_id.parse::<u32>().ok())
                                 } else {
                                     None
                                 }
