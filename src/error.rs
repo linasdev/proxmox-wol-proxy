@@ -23,6 +23,7 @@ pub enum PwpError {
     InvalidProxmoxResponse(String),
     MissingProxyTarget(String),
     DuplicateProxyTargetName(String),
+    ConflictingSharedVmMaxIdleSecs(u32),
     InvalidProxyTargetUrl(url::ParseError),
     InvalidHeaderUrl(url::ParseError),
     InvalidMacAddress(macaddr::ParseError),
@@ -69,6 +70,12 @@ impl Display for PwpError {
             }
             PwpError::DuplicateProxyTargetName(name) => {
                 write!(fmt, "Duplicate proxy target name: {name}")
+            }
+            PwpError::ConflictingSharedVmMaxIdleSecs(vm_id) => {
+                write!(
+                    fmt,
+                    "Proxy targets sharing VM '{vm_id}' have differing max-idle-secs"
+                )
             }
             PwpError::InvalidProxyTargetUrl(error) => {
                 write!(fmt, "Invalid proxy target URL: {error}")
@@ -123,6 +130,7 @@ impl IntoResponse for PwpError {
 
         match self {
             PwpError::DuplicateProxyTargetName(_)
+            | PwpError::ConflictingSharedVmMaxIdleSecs(_)
             | PwpError::InvalidProxyTargetUrl(_)
             | PwpError::InvalidMacAddress(_)
             | PwpError::InvalidBroadcastAddress(_)

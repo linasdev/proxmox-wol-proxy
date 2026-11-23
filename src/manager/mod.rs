@@ -62,6 +62,20 @@ impl PwpManager {
             .map(PwpProxyTarget::new)
             .map(Arc::new)
             .collect::<Vec<_>>();
+
+        let mut max_idle_durations_by_vm_id = BTreeMap::new();
+        for proxy_target in proxy_targets.iter() {
+            let existing = max_idle_durations_by_vm_id
+                .entry(proxy_target.vm_id())
+                .or_insert(proxy_target.max_idle_duration());
+
+            if *existing != proxy_target.max_idle_duration() {
+                return Err(PwpError::ConflictingSharedVmMaxIdleSecs(
+                    proxy_target.vm_id(),
+                ));
+            }
+        }
+
         let active_node_future = Arc::new(Mutex::new(None));
         let active_vm_futures = Arc::new(Mutex::new(BTreeMap::new()));
         let active_vms = Arc::new(Mutex::new(BTreeMap::new()));
@@ -138,7 +152,12 @@ impl PwpManager {
                 "Proxmox node is already running managed VM '{running_vm_id}', starting shutdown timer"
             );
 
-            let active_vm = PwpActiveVm::new(running_vm_id, true, max_idle_duration);
+            let vm_max_idle_duration = proxy_targets
+                .iter()
+                .find(|proxy_target| proxy_target.vm_id() == running_vm_id)
+                .and_then(|proxy_target| proxy_target.max_idle_duration())
+                .unwrap_or(max_idle_duration);
+            let active_vm = PwpActiveVm::new(running_vm_id, true, vm_max_idle_duration);
             active_vms.lock().await.insert(running_vm_id, active_vm);
         }
 
@@ -543,7 +562,13 @@ impl PwpManager {
                 (ongoing_request_guard, false)
             } else {
                 let mut active_vm_guard = self.active_vms.lock().await;
-                let active_vm = PwpActiveVm::new(target_vm_id, false, self.max_idle_duration);
+                let active_vm = PwpActiveVm::new(
+                    target_vm_id,
+                    false,
+                    proxy_target
+                        .max_idle_duration()
+                        .unwrap_or(self.max_idle_duration),
+                );
                 active_vm_guard.insert(target_vm_id, active_vm.clone());
                 (active_vm.handle_request(), true)
             };

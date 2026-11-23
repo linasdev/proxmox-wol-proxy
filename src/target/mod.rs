@@ -1,3 +1,4 @@
+use std::time::Duration;
 use crate::error::PwpError;
 use crate::target::settings::PwpTargetSettings;
 use axum::http::{HeaderMap, HeaderName, Request, Response, header, response};
@@ -29,6 +30,7 @@ pub struct PwpProxyTarget {
     name: String,
     vm_id: u32,
     default_url: Option<String>,
+    max_idle_duration: Option<Duration>,
     should_proxy: bool,
     preserve_host_header: bool,
 }
@@ -38,6 +40,7 @@ impl PwpProxyTarget {
         let name = settings.name.clone();
         let vm_id = settings.vm_id;
         let default_url = settings.default_url.clone();
+        let max_idle_duration = settings.max_idle_secs.map(Duration::from_secs);
         let should_proxy = settings.should_proxy;
         let preserve_host_header = settings.preserve_host_header;
 
@@ -56,6 +59,7 @@ impl PwpProxyTarget {
                 name,
                 vm_id,
                 default_url,
+                max_idle_duration,
                 should_proxy: true,
                 preserve_host_header,
             }
@@ -66,6 +70,7 @@ impl PwpProxyTarget {
                 name,
                 vm_id,
                 default_url: None,
+                max_idle_duration,
                 should_proxy: false,
                 preserve_host_header,
             }
@@ -82,6 +87,10 @@ impl PwpProxyTarget {
 
     pub fn default_url(&self) -> Option<&str> {
         self.default_url.as_deref()
+    }
+
+    pub fn max_idle_duration(&self) -> Option<Duration> {
+        self.max_idle_duration
     }
 
     pub fn should_proxy(&self) -> bool {

@@ -7,6 +7,9 @@ pub struct PwpTargetSettings {
     pub vm_id: u32,
     pub default_url: Option<String>,
 
+    #[serde(default)]
+    pub max_idle_secs: Option<u64>,
+
     #[serde(default = "default_should_proxy")]
     pub should_proxy: bool,
 
