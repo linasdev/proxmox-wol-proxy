@@ -446,8 +446,12 @@ impl PwpManager {
         let target_vm_id = proxy_target.vm_id();
 
         {
-            let ongoing_request_guard =
-                self.active_vms.lock().await.get(&target_vm_id).map(|active_vm| active_vm.handle_request());
+            let ongoing_request_guard = self
+                .active_vms
+                .lock()
+                .await
+                .get(&target_vm_id)
+                .map(|active_vm| active_vm.handle_request());
 
             info!(
                 "Ensuring VM '{target_vm_id}' is active for proxy target: {}",
@@ -476,11 +480,17 @@ impl PwpManager {
                         return true;
                     }
 
-                    if !target_is_mutually_exclusive || !self.treat_non_managed_vms_as_mutually_exclusive {
+                    if !target_is_mutually_exclusive
+                        || !self.treat_non_managed_vms_as_mutually_exclusive
+                    {
                         return false;
                     }
 
-                    if self.proxy_targets.iter().any(|proxy_target| proxy_target.vm_id() == *vm_id) {
+                    if self
+                        .proxy_targets
+                        .iter()
+                        .any(|proxy_target| proxy_target.vm_id() == *vm_id)
+                    {
                         return false;
                     }
 
@@ -506,14 +516,13 @@ impl PwpManager {
             if need_to_start_vm && can_start_vm {
                 self.proxmox_node.start_vm(target_vm_id).await?;
             } else if need_to_start_vm {
-                info!("VM '{target_vm_id}' needs to be started on the Proxmox node, which is already running (a) conflicting VM(s): {running_mutually_exclusive_vm_ids:?}");
+                info!(
+                    "VM '{target_vm_id}' needs to be started on the Proxmox node, which is already running (a) conflicting VM(s): {running_mutually_exclusive_vm_ids:?}"
+                );
                 return Err(PwpError::ProxmoxNodeBusy);
             }
 
-            let mut vm_running = self
-                .proxmox_node
-                .ping_vm_guest_agent(target_vm_id)
-                .await?;
+            let mut vm_running = self.proxmox_node.ping_vm_guest_agent(target_vm_id).await?;
 
             if !vm_running {
                 info!("VM guest agent ping failed, will wait for VM to start");
@@ -549,29 +558,27 @@ impl PwpManager {
                         _ = sleep(self.guest_agent_ping_delay_duration) => {},
                     }
 
-                    vm_running = self
-                        .proxmox_node
-                        .ping_vm_guest_agent(target_vm_id)
-                        .await?;
+                    vm_running = self.proxmox_node.ping_vm_guest_agent(target_vm_id).await?;
                 }
             }
 
             info!("VM guest agent ping succeeded");
 
-            let (ongoing_request_guard, active_vm_created) = if let Some(ongoing_request_guard) = ongoing_request_guard {
-                (ongoing_request_guard, false)
-            } else {
-                let mut active_vm_guard = self.active_vms.lock().await;
-                let active_vm = PwpActiveVm::new(
-                    target_vm_id,
-                    false,
-                    proxy_target
-                        .max_idle_duration()
-                        .unwrap_or(self.max_idle_duration),
-                );
-                active_vm_guard.insert(target_vm_id, active_vm.clone());
-                (active_vm.handle_request(), true)
-            };
+            let (ongoing_request_guard, active_vm_created) =
+                if let Some(ongoing_request_guard) = ongoing_request_guard {
+                    (ongoing_request_guard, false)
+                } else {
+                    let mut active_vm_guard = self.active_vms.lock().await;
+                    let active_vm = PwpActiveVm::new(
+                        target_vm_id,
+                        false,
+                        proxy_target
+                            .max_idle_duration()
+                            .unwrap_or(self.max_idle_duration),
+                    );
+                    active_vm_guard.insert(target_vm_id, active_vm.clone());
+                    (active_vm.handle_request(), true)
+                };
 
             if active_vm_created {
                 self.active_vm_change_notify.notify_waiters();
@@ -598,8 +605,8 @@ impl PwpManager {
             self.active_node_future.lock().await.take();
             result
         }
-            .boxed()
-            .shared();
+        .boxed()
+        .shared();
 
         PwpActiveNodeFuture { future }
     }
