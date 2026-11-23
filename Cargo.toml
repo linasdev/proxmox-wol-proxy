@@ -48,3 +48,7 @@ features = ["aws-lc-rs"]
 version = "0.103.14"
 default-features = false
 features = ["aws-lc-rs"]
+
+[dev-dependencies]
+googletest = "0.14.4"
+mockito = "1.7.2"

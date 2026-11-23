@@ -22,6 +22,9 @@ pub mod service;
 pub mod settings;
 pub mod target;
 
+#[cfg(test)]
+mod test;
+
 #[derive(Clone)]
 pub struct PwpState {
     pub proxy_target_client: Client,

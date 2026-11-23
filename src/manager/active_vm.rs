@@ -104,3 +104,87 @@ impl Drop for PwpOngoingRequestGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use googletest::prelude::*;
+    use tokio::time::timeout;
+
+    const SHORT: Duration = Duration::from_millis(50);
+
+    #[tokio::test]
+    async fn new_idle_vm_notifies_idle() {
+        let vm = PwpActiveVm::new(1, true, Duration::from_secs(10));
+
+        assert_that!(
+            timeout(SHORT, vm.idle_notify().notified()).await,
+            ok(anything())
+        );
+    }
+
+    #[tokio::test]
+    async fn new_busy_vm_does_not_notify_idle() {
+        let vm = PwpActiveVm::new(1, false, Duration::from_secs(10));
+
+        assert_that!(
+            timeout(SHORT, vm.idle_notify().notified()).await,
+            err(anything())
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_last_guard_notifies_idle() {
+        let vm = PwpActiveVm::new(1, false, Duration::from_secs(10));
+        let first = vm.handle_request();
+        let second = vm.handle_request();
+
+        drop(first);
+        assert_that!(
+            timeout(SHORT, vm.idle_notify().notified()).await,
+            err(anything())
+        );
+
+        drop(second);
+        assert_that!(
+            timeout(SHORT, vm.idle_notify().notified()).await,
+            ok(anything())
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_notifies_busy_waiters() {
+        let vm = PwpActiveVm::new(1, true, Duration::from_secs(10));
+        let waiter = {
+            let vm = vm.clone();
+            tokio::spawn(async move { vm.busy_notify().notified().await })
+        };
+        tokio::task::yield_now().await;
+
+        let _guard = vm.handle_request();
+
+        assert_that!(timeout(SHORT, waiter).await, ok(anything()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_at_is_idle_since_plus_max_idle() {
+        let max_idle = Duration::from_secs(120);
+        let vm = PwpActiveVm::new(1, true, max_idle);
+        let shutdown_at = vm.shutdown_at();
+        let now = Instant::now();
+
+        assert_that!(vm.max_idle_duration(), eq(max_idle));
+        assert_that!(
+            shutdown_at + Duration::from_secs(1) >= now + max_idle,
+            is_true()
+        );
+        assert_that!(shutdown_at <= now + max_idle, is_true());
+    }
+
+    #[tokio::test]
+    async fn debug_output_contains_vm_id() {
+        let vm = PwpActiveVm::new(77, true, Duration::ZERO);
+
+        assert_that!(format!("{vm:?}").contains("77"), is_true());
+    }
+}

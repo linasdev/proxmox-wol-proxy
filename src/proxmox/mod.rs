@@ -277,3 +277,347 @@ impl PwpProxmoxNode {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::{TestContext, initialize_test_context};
+    use googletest::prelude::*;
+    use mockito::Matcher;
+    use serde_json::json;
+
+    async fn context() -> Result<TestContext, PwpError> {
+        initialize_test_context("", "", &[("vm1", 1, "")]).await
+    }
+
+    #[tokio::test]
+    async fn new_rejects_invalid_mac_address() -> Result<(), PwpError> {
+        let ctx = initialize_test_context("", "mac-address = \"nope\"", &[("vm1", 1, "")]).await?;
+
+        assert_that!(
+            ctx.node().map(|_| ()),
+            err(matches_pattern!(PwpError::InvalidMacAddress(_)))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_rejects_invalid_broadcast_address() -> Result<(), PwpError> {
+        let ctx =
+            initialize_test_context("", "broadcast-address = \"nope\"", &[("vm1", 1, "")]).await?;
+
+        assert_that!(
+            ctx.node().map(|_| ()),
+            err(matches_pattern!(PwpError::InvalidBroadcastAddress(_)))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_rejects_invalid_authorization_header() -> Result<(), PwpError> {
+        let ctx = initialize_test_context("", "token-secret = \"bad\\nsecret\"", &[("vm1", 1, "")])
+            .await?;
+
+        assert_that!(
+            ctx.node().map(|_| ()),
+            err(matches_pattern!(
+                PwpError::InvalidProxmoxAuthorizationHeader
+            ))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_running_vm_ids_returns_only_running_qemu_vms() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        let body = json!({"data": [
+            {"id": "qemu/101", "status": "running"},
+            {"id": "qemu/102", "status": "stopped"},
+            {"id": "lxc/103", "status": "running"},
+            {"id": "qemu/notanumber", "status": "running"},
+            {"id": "qemu/104", "status": "running"},
+            {"id": "qemu/105"},
+        ]});
+        ctx.mock_running_vms_response(200, body.to_string()).await;
+
+        let result = ctx.node()?.get_running_vm_ids().await;
+
+        assert_that!(result, ok(some(elements_are![eq(&101), eq(&104)])));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_running_vm_ids_returns_empty_when_no_vms() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.mock_running_vms(&[]).await;
+
+        let result = ctx.node()?.get_running_vm_ids().await;
+
+        assert_that!(result, ok(some(is_empty())));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_running_vm_ids_sends_api_token_authorization() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.mock_running_vms(&[]).await;
+
+        // The running VMs mock only matches requests with the expected header
+        let result = ctx.node()?.get_running_vm_ids().await;
+
+        assert_that!(result, ok(some(anything())));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_running_vm_ids_returns_none_when_unreachable() -> Result<(), PwpError> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let ctx =
+            initialize_test_context("", &format!("base-url = \"{base_url}\""), &[("vm1", 1, "")])
+                .await?;
+
+        let result = ctx.node()?.get_running_vm_ids().await;
+
+        assert_that!(result, ok(none()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_running_vm_ids_rejects_body_without_data() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.mock_running_vms_response(200, json!({"nope": 1}).to_string())
+            .await;
+
+        let result = ctx.node()?.get_running_vm_ids().await;
+
+        assert_that!(
+            result,
+            err(matches_pattern!(PwpError::InvalidProxmoxResponse(_)))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_running_vm_ids_rejects_invalid_json() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.mock_running_vms_response(200, "not json".to_string())
+            .await;
+
+        let result = ctx.node()?.get_running_vm_ids().await;
+
+        assert_that!(result, err(matches_pattern!(PwpError::SerdeJson(_))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_running_vm_ids_errors_on_server_error() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.mock_running_vms_response(500, String::new()).await;
+
+        let result = ctx.node()?.get_running_vm_ids().await;
+
+        assert_that!(
+            result,
+            err(matches_pattern!(PwpError::ProxmoxClientError(_)))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_vm_posts_to_start_endpoint() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        let mock = ctx
+            .server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/status/start")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.start_vm(101).await;
+
+        assert_that!(result, ok(anything()));
+        mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_vm_errors_on_failure_status() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/status/start")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.start_vm(101).await;
+
+        assert_that!(
+            result,
+            err(matches_pattern!(PwpError::ProxmoxClientError(_)))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_vm_posts_to_shutdown_endpoint() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        let mock = ctx
+            .server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/status/shutdown")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.shutdown_vm(101).await;
+
+        assert_that!(result, ok(anything()));
+        mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_vm_errors_on_failure_status() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/status/shutdown")
+            .with_status(403)
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.shutdown_vm(101).await;
+
+        assert_that!(
+            result,
+            err(matches_pattern!(PwpError::ProxmoxClientError(_)))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_posts_shutdown_command_to_node_status() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        let mock = ctx
+            .server
+            .mock("POST", "/api2/json/nodes/node/status")
+            .match_body(Matcher::UrlEncoded("command".into(), "shutdown".into()))
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.shutdown().await;
+
+        assert_that!(result, ok(anything()));
+        mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ping_vm_guest_agent_returns_true_on_success() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/agent/ping")
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.ping_vm_guest_agent(101).await;
+
+        assert_that!(result, ok(is_true()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ping_vm_guest_agent_returns_false_when_vm_not_running() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/agent/ping")
+            .with_status(500)
+            .with_body(json!({"message": "VM 101 is not running\n"}).to_string())
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.ping_vm_guest_agent(101).await;
+
+        assert_that!(result, ok(is_false()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ping_vm_guest_agent_returns_false_when_agent_not_running() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/agent/ping")
+            .with_status(500)
+            .with_body(json!({"message": "QEMU guest agent is not running"}).to_string())
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.ping_vm_guest_agent(101).await;
+
+        assert_that!(result, ok(is_false()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ping_vm_guest_agent_rejects_other_500_messages() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/agent/ping")
+            .with_status(500)
+            .with_body(json!({"message": "VM 102 is not running"}).to_string())
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.ping_vm_guest_agent(101).await;
+
+        assert_that!(
+            result,
+            err(matches_pattern!(PwpError::InvalidProxmoxResponse(_)))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ping_vm_guest_agent_errors_on_other_failure_status() -> Result<(), PwpError> {
+        let mut ctx = context().await?;
+        ctx.server
+            .mock("POST", "/api2/json/nodes/node/qemu/101/agent/ping")
+            .with_status(403)
+            .create_async()
+            .await;
+
+        let result = ctx.node()?.ping_vm_guest_agent(101).await;
+
+        assert_that!(
+            result,
+            err(matches_pattern!(PwpError::ProxmoxClientError(_)))
+        );
+
+        Ok(())
+    }
+}

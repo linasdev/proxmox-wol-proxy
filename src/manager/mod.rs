@@ -662,3 +662,337 @@ impl PwpManager {
         date_time.to_rfc3339()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::initialize_test_context;
+    use googletest::prelude::*;
+
+    fn discard<T>(result: Result<T, PwpError>) -> Result<(), PwpError> {
+        result.map(|_| ())
+    }
+
+    fn proxy_target(manager: &PwpManager, vm_id: u32) -> Arc<PwpProxyTarget> {
+        manager
+            .proxy_targets
+            .iter()
+            .find(|proxy_target| proxy_target.vm_id() == vm_id)
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn is_mutually_exclusive_checks_all_groups() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "mutually-exclusive-vm-ids = [[1, 2], [3, 4]]",
+            "",
+            &[("vm1", 1, "")],
+        )
+        .await?;
+        ctx.mock_running_vms(&[]).await;
+        let manager = ctx.manager().await?;
+
+        assert_that!(manager.is_mutually_exclusive(1), is_true());
+        assert_that!(manager.is_mutually_exclusive(4), is_true());
+        assert_that!(manager.is_mutually_exclusive(5), is_false());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn is_mutually_exclusive_without_groups_is_false() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context("", "", &[("vm1", 1, "")]).await?;
+        ctx.mock_running_vms(&[]).await;
+        let manager = ctx.manager().await?;
+
+        assert_that!(manager.is_mutually_exclusive(1), is_false());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflicting_vm_ids_excludes_self_and_unrelated_groups() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "mutually-exclusive-vm-ids = [[1, 2], [3, 4]]",
+            "",
+            &[("vm1", 1, "")],
+        )
+        .await?;
+        ctx.mock_running_vms(&[]).await;
+        let manager = ctx.manager().await?;
+
+        assert_that!(manager.conflicting_vm_ids(1), elements_are![eq(&2)]);
+        assert_that!(manager.conflicting_vm_ids(4), elements_are![eq(&3)]);
+        assert_that!(manager.conflicting_vm_ids(5), is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflicting_vm_ids_is_not_transitive_across_groups() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "mutually-exclusive-vm-ids = [[1, 2], [2, 3]]",
+            "",
+            &[("vm1", 1, "")],
+        )
+        .await?;
+        ctx.mock_running_vms(&[]).await;
+        let manager = ctx.manager().await?;
+
+        assert_that!(manager.conflicting_vm_ids(1), elements_are![eq(&2)]);
+        assert_that!(manager.conflicting_vm_ids(2), elements_are![eq(&1), eq(&3)]);
+        assert_that!(manager.conflicting_vm_ids(3), elements_are![eq(&2)]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflicting_vm_ids_handles_group_with_duplicates() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "mutually-exclusive-vm-ids = [[1, 1, 2]]",
+            "",
+            &[("vm1", 1, "")],
+        )
+        .await?;
+        ctx.mock_running_vms(&[]).await;
+        let manager = ctx.manager().await?;
+
+        assert_that!(manager.conflicting_vm_ids(1), elements_are![eq(&2)]);
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn format_instant_returns_rfc3339_for_future_instant() {
+        let offset = chrono::Duration::hours(1);
+        let before = Utc::now();
+        let formatted = PwpManager::format_instant(Instant::now() + Duration::from_secs(3600));
+        let after = Utc::now();
+
+        let parsed = chrono::DateTime::parse_from_rfc3339(&formatted)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_that!(parsed, all![ge(before + offset), le(after + offset)]);
+    }
+
+    #[tokio::test]
+    async fn new_rejects_shared_vm_with_differing_max_idle_secs() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "",
+            "",
+            &[
+                ("a", 1, "max-idle-secs = 10"),
+                ("b", 1, "max-idle-secs = 20"),
+            ],
+        )
+        .await?;
+        ctx.mock_running_vms(&[]).await;
+
+        let result = ctx.manager().await;
+
+        assert_that!(
+            discard(result),
+            err(matches_pattern!(PwpError::ConflictingSharedVmMaxIdleSecs(
+                eq(&1)
+            )))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_accepts_shared_vm_with_equal_max_idle_secs() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "",
+            "",
+            &[
+                ("a", 1, "max-idle-secs = 10"),
+                ("b", 1, "max-idle-secs = 10"),
+            ],
+        )
+        .await?;
+        ctx.mock_running_vms(&[]).await;
+
+        let manager = ctx.manager().await?;
+
+        assert_that!(manager.proxy_targets.len(), eq(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_tracks_only_running_managed_vms() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context("", "", &[("vm1", 1, "")]).await?;
+        ctx.mock_running_vms(&[1, 99]).await;
+        let manager = ctx.manager().await?;
+
+        let active_vm_ids = manager
+            .active_vms
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_that!(active_vm_ids, elements_are![eq(&1)]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_uses_target_max_idle_secs_for_running_vm() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "max-idle-secs = 100",
+            "",
+            &[("vm1", 1, "max-idle-secs = 7"), ("vm2", 2, "")],
+        )
+        .await?;
+        ctx.mock_running_vms(&[1, 2]).await;
+        let manager = ctx.manager().await?;
+
+        let active_vms = manager.active_vms.lock().await;
+        assert_that!(
+            active_vms[&1].max_idle_duration(),
+            eq(Duration::from_secs(7))
+        );
+        assert_that!(
+            active_vms[&2].max_idle_duration(),
+            eq(Duration::from_secs(100))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_active_vm_does_not_start_running_vm() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context("", "", &[("vm1", 1, "")]).await?;
+        ctx.mock_running_vms(&[1]).await;
+        let manager = ctx.manager().await?;
+        let start = ctx
+            .server
+            .mock("POST", "/api2/json/nodes/node/qemu/1/status/start")
+            .expect(0)
+            .create_async()
+            .await;
+        let ping = ctx
+            .server
+            .mock("POST", "/api2/json/nodes/node/qemu/1/agent/ping")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = manager
+            .clone()
+            .ensure_active_vm_for_target(proxy_target(&manager, 1))
+            .await;
+
+        assert_that!(discard(result), ok(anything()));
+        start.assert_async().await;
+        ping.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_active_vm_starts_stopped_vm_and_registers_it() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context("", "", &[("vm1", 1, "")]).await?;
+        ctx.mock_running_vms(&[]).await;
+        let manager = ctx.manager().await?;
+        let start = ctx
+            .server
+            .mock("POST", "/api2/json/nodes/node/qemu/1/status/start")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        ctx.server
+            .mock("POST", "/api2/json/nodes/node/qemu/1/agent/ping")
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let result = manager
+            .clone()
+            .ensure_active_vm_for_target(proxy_target(&manager, 1))
+            .await;
+
+        assert_that!(discard(result), ok(anything()));
+        start.assert_async().await;
+        assert_that!(manager.active_vms.lock().await.contains_key(&1), is_true());
+        assert_that!(manager.active_vm_futures.lock().await.len(), eq(0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_active_vm_rejects_vm_conflicting_with_running_one() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "mutually-exclusive-vm-ids = [[1, 2]]",
+            "",
+            &[("vm1", 1, ""), ("vm2", 2, "")],
+        )
+        .await?;
+        ctx.mock_running_vms(&[2]).await;
+        let manager = ctx.manager().await?;
+        let start = ctx
+            .server
+            .mock("POST", "/api2/json/nodes/node/qemu/1/status/start")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let result = manager
+            .clone()
+            .ensure_active_vm_for_target(proxy_target(&manager, 1))
+            .await;
+
+        assert_that!(
+            discard(result),
+            err(matches_pattern!(PwpError::ProxmoxNodeBusy))
+        );
+        start.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_active_vm_starts_unrelated_vms_independently() -> Result<(), PwpError> {
+        let mut ctx = initialize_test_context(
+            "mutually-exclusive-vm-ids = [[1, 2]]",
+            "",
+            &[("vm1", 1, ""), ("vm3", 3, "")],
+        )
+        .await?;
+        ctx.mock_running_vms(&[1]).await;
+        let manager = ctx.manager().await?;
+        let start = ctx
+            .server
+            .mock("POST", "/api2/json/nodes/node/qemu/3/status/start")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        ctx.server
+            .mock("POST", mockito::Matcher::Regex(r"agent/ping$".into()))
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let (first, second) = tokio::join!(
+            manager
+                .clone()
+                .ensure_active_vm_for_target(proxy_target(&manager, 1)),
+            manager
+                .clone()
+                .ensure_active_vm_for_target(proxy_target(&manager, 3)),
+        );
+
+        assert_that!(discard(first), ok(anything()));
+        assert_that!(discard(second), ok(anything()));
+        start.assert_async().await;
+
+        Ok(())
+    }
+}

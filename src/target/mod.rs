@@ -1,7 +1,6 @@
-use std::time::Duration;
 use crate::error::PwpError;
 use crate::target::settings::PwpTargetSettings;
-use axum::http::{HeaderMap, HeaderName, Request, Response, header, response};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, header, response};
 use http_body_util::BodyExt;
 use log::{info, warn};
 use reqwest::{Body, Client, RequestBuilder};
@@ -9,6 +8,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use url::Url;
 
 pub mod settings;
@@ -158,6 +158,10 @@ impl PwpProxyTarget {
                 continue;
             }
 
+            if header_name == "x-forwarded-for" {
+                continue;
+            }
+
             upstream_request_builder =
                 upstream_request_builder.header(header_name.clone(), header_value.clone());
         }
@@ -175,22 +179,26 @@ impl PwpProxyTarget {
                 upstream_request_builder.header(header::HOST, host_header_value)
         }
 
-        if let Some(x_forwarded_for_header_value) =
-            header_map.get(HeaderName::from_static("x-forwarded-for"))
-        {
-            match x_forwarded_for_header_value.to_str() {
-                Ok(original_x_forwarded_for) => {
-                    let new_x_forwarded_for =
-                        format!("{}, {}", original_x_forwarded_for, peer_address.ip());
-                    upstream_request_builder.header("x-forwarded-for", new_x_forwarded_for)
-                }
-                Err(error) => {
-                    warn!("Failed to parse 'X-Forwarded-For' header value with error: {error}");
-                    upstream_request_builder
-                }
+        let mut x_forwarded_for = header_map
+            .get_all("x-forwarded-for")
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect::<Vec<_>>()
+            .join(&b", "[..]);
+
+        if !x_forwarded_for.is_empty() {
+            x_forwarded_for.extend_from_slice(b", ");
+        }
+        x_forwarded_for.extend_from_slice(peer_address.ip().to_string().as_bytes());
+
+        match HeaderValue::from_bytes(&x_forwarded_for) {
+            Ok(x_forwarded_for) => {
+                upstream_request_builder.header("x-forwarded-for", x_forwarded_for)
             }
-        } else {
-            upstream_request_builder.header("x-forwarded-for", peer_address.ip().to_string())
+            Err(error) => {
+                warn!("Failed to build 'X-Forwarded-For' header value with error: {error}");
+                upstream_request_builder
+            }
         }
     }
 
@@ -258,5 +266,242 @@ impl PwpProxyTarget {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use googletest::prelude::*;
+
+    fn settings() -> PwpTargetSettings {
+        PwpTargetSettings {
+            name: "vm1".to_string(),
+            vm_id: 101,
+            default_url: Some("https://vm1".to_string()),
+            max_idle_secs: Some(60),
+            should_proxy: true,
+            preserve_host_header: false,
+        }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                HeaderName::from_str(name).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[gtest]
+    fn new_exposes_settings() {
+        let target = PwpProxyTarget::new(settings());
+
+        assert_that!(target.name(), eq("vm1"));
+        assert_that!(target.vm_id(), eq(101));
+        assert_that!(target.default_url(), eq(Some("https://vm1")));
+        assert_that!(
+            target.max_idle_duration(),
+            eq(Some(Duration::from_secs(60)))
+        );
+        assert_that!(target.should_proxy(), is_true());
+    }
+
+    #[gtest]
+    fn new_without_proxying_drops_default_url() {
+        let target = PwpProxyTarget::new(PwpTargetSettings {
+            should_proxy: false,
+            ..settings()
+        });
+
+        assert_that!(target.should_proxy(), is_false());
+        assert_that!(target.default_url(), eq(None));
+    }
+
+    #[gtest]
+    fn dynamic_hop_by_hop_headers_come_from_connection_header() {
+        let map = headers(&[("connection", "X-Foo, , x-bar,not a header!")]);
+        let result = PwpProxyTarget::extract_dynamic_hop_by_hop_headers(&map);
+
+        assert_that!(
+            result,
+            unordered_elements_are![
+                eq(&HeaderName::from_static("x-foo")),
+                eq(&HeaderName::from_static("x-bar")),
+            ]
+        );
+    }
+
+    #[gtest]
+    fn dynamic_hop_by_hop_headers_empty_without_connection_header() {
+        let result = PwpProxyTarget::extract_dynamic_hop_by_hop_headers(&HeaderMap::new());
+
+        assert_that!(result, is_empty());
+    }
+
+    #[gtest]
+    fn should_strip_header_rules() {
+        let none = HashSet::new();
+        let dynamic = HashSet::from([HeaderName::from_static("x-dynamic")]);
+
+        assert_that!(
+            PwpProxyTarget::should_strip_header(&header::UPGRADE, &none, true),
+            is_true()
+        );
+        assert_that!(
+            PwpProxyTarget::should_strip_header(
+                &HeaderName::from_static("x-dynamic"),
+                &dynamic,
+                true
+            ),
+            is_true()
+        );
+        assert_that!(
+            PwpProxyTarget::should_strip_header(&HeaderName::from_static("x-dynamic"), &none, true),
+            is_false()
+        );
+        assert_that!(
+            PwpProxyTarget::should_strip_header(&header::HOST, &none, false),
+            is_true()
+        );
+        assert_that!(
+            PwpProxyTarget::should_strip_header(&header::HOST, &none, true),
+            is_false()
+        );
+        assert_that!(
+            PwpProxyTarget::should_strip_header(&header::ACCEPT, &none, false),
+            is_false()
+        );
+    }
+
+    #[gtest]
+    fn downstream_headers_strip_hop_by_hop_but_keep_host() {
+        let upstream = headers(&[
+            ("connection", "x-secret"),
+            ("x-secret", "1"),
+            ("upgrade", "websocket"),
+            ("host", "example"),
+            ("content-type", "text/plain"),
+        ]);
+        let response =
+            PwpProxyTarget::prepare_headers_for_downstream(Response::builder(), &upstream)
+                .body(())
+                .unwrap();
+        let result = response.headers();
+
+        assert_that!(result.get("connection"), none());
+        assert_that!(result.get("x-secret"), none());
+        assert_that!(result.get("upgrade"), none());
+        assert_that!(result.get("host").unwrap(), eq("example"));
+        assert_that!(result.get("content-type").unwrap(), eq("text/plain"));
+    }
+
+    fn build_upstream(target: &PwpProxyTarget, url: &str, map: &HeaderMap) -> reqwest::Request {
+        let client = Client::new();
+        target
+            .prepare_headers_for_upstream(
+                client.get(url),
+                Url::parse(url).unwrap(),
+                map,
+                &"10.0.0.5:1234".parse().unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    #[gtest]
+    fn upstream_headers_rewrite_host_and_set_forwarded_for() {
+        let target = PwpProxyTarget::new(settings());
+        let request = build_upstream(
+            &target,
+            "https://vm1.example:8443/path",
+            &headers(&[("host", "original"), ("accept", "*/*")]),
+        );
+
+        assert_that!(
+            request.headers().get("host").unwrap(),
+            eq("vm1.example:8443")
+        );
+        assert_that!(request.headers().get("accept").unwrap(), eq("*/*"));
+        assert_that!(
+            request.headers().get("x-forwarded-for").unwrap(),
+            eq("10.0.0.5")
+        );
+    }
+
+    #[gtest]
+    fn upstream_headers_append_to_existing_forwarded_for() {
+        let target = PwpProxyTarget::new(settings());
+        let request = build_upstream(
+            &target,
+            "https://vm1.example/",
+            &headers(&[("x-forwarded-for", "1.2.3.4")]),
+        );
+
+        assert_that!(
+            request.headers().get_all("x-forwarded-for").iter().count(),
+            eq(1)
+        );
+        assert_that!(
+            request.headers().get("x-forwarded-for").unwrap(),
+            eq("1.2.3.4, 10.0.0.5")
+        );
+    }
+
+    #[gtest]
+    fn upstream_headers_preserve_host_when_configured() {
+        let target = PwpProxyTarget::new(PwpTargetSettings {
+            preserve_host_header: true,
+            ..settings()
+        });
+        let request = build_upstream(
+            &target,
+            "https://vm1.example/",
+            &headers(&[("host", "original")]),
+        );
+
+        assert_that!(request.headers().get("host").unwrap(), eq("original"));
+    }
+
+    #[gtest]
+    fn upstream_headers_append_peer_to_non_utf8_forwarded_for() {
+        let target = PwpProxyTarget::new(settings());
+        let mut map = HeaderMap::new();
+        map.insert(
+            "x-forwarded-for",
+            header::HeaderValue::from_bytes(b"1.2.3.\xff").unwrap(),
+        );
+
+        let request = build_upstream(&target, "https://vm1.example/", &map);
+
+        assert_that!(
+            request.headers().get("x-forwarded-for").unwrap().as_bytes(),
+            eq(b"1.2.3.\xff, 10.0.0.5")
+        );
+    }
+
+    #[gtest]
+    fn upstream_headers_merge_multiple_forwarded_for_headers() {
+        let target = PwpProxyTarget::new(settings());
+        let request = build_upstream(
+            &target,
+            "https://vm1.example/",
+            &headers(&[
+                ("x-forwarded-for", "1.1.1.1"),
+                ("x-forwarded-for", "2.2.2.2"),
+            ]),
+        );
+
+        assert_that!(
+            request.headers().get_all("x-forwarded-for").iter().count(),
+            eq(1)
+        );
+        assert_that!(
+            request.headers().get("x-forwarded-for").unwrap(),
+            eq("1.1.1.1, 2.2.2.2, 10.0.0.5")
+        );
     }
 }
