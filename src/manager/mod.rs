@@ -9,7 +9,7 @@ use chrono::Utc;
 use futures_util::future;
 use futures_util::future::{BoxFuture, FutureExt, OptionFuture, select_all};
 use log::{debug, info, warn};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ pub struct PwpManager {
     active_vm_change_notify: Notify,
 
     trusted_proxy_addresses: Option<Vec<IpAddr>>,
-    mutually_exclusive_vm_ids: Vec<u32>,
+    mutually_exclusive_vm_ids: Vec<Vec<u32>>,
     treat_non_managed_vms_as_mutually_exclusive: bool,
     prevent_shutdown_when_non_managed_vms_active: bool,
     max_idle_duration: Duration,
@@ -113,7 +113,7 @@ impl PwpManager {
 
         if !mutually_exclusive_vm_ids.is_empty() {
             info!(
-                "Will start these VMs one at a time (mutually exclusive): {mutually_exclusive_vm_ids:?}"
+                "Will start VMs in these groups one at a time (mutually exclusive): {mutually_exclusive_vm_ids:?}"
             );
         }
 
@@ -380,10 +380,12 @@ impl PwpManager {
             if let Some(active_vm_future) = active_vm_futures_guard.get(&target_vm_id) {
                 active_vm_future.clone()
             } else {
-                if self.mutually_exclusive_vm_ids.contains(&target_vm_id) {
+                let conflicting_vm_ids = self.conflicting_vm_ids(target_vm_id);
+
+                {
                     if let Some(starting_vm_id) = active_vm_futures_guard
                         .keys()
-                        .find(|vm_id| self.mutually_exclusive_vm_ids.contains(vm_id))
+                        .find(|vm_id| conflicting_vm_ids.contains(vm_id))
                     {
                         info!(
                             "VM '{target_vm_id}' is required for request but manager is currently starting conflicting VM '{starting_vm_id}'"
@@ -441,15 +443,21 @@ impl PwpManager {
                 .await?
                 .ok_or(PwpError::ProxmoxNodeStartTimedOut)?;
 
+            let target_is_mutually_exclusive = self.is_mutually_exclusive(target_vm_id);
+            let conflicting_vm_ids = self.conflicting_vm_ids(target_vm_id);
             let running_mutually_exclusive_vm_ids = running_vm_ids
                 .iter()
                 .copied()
                 .filter(|vm_id| {
-                    if self.mutually_exclusive_vm_ids.contains(vm_id) {
+                    if *vm_id == target_vm_id {
+                        return false;
+                    }
+
+                    if conflicting_vm_ids.contains(vm_id) {
                         return true;
                     }
 
-                    if !self.treat_non_managed_vms_as_mutually_exclusive {
+                    if !target_is_mutually_exclusive || !self.treat_non_managed_vms_as_mutually_exclusive {
                         return false;
                     }
 
@@ -474,10 +482,7 @@ impl PwpManager {
             }
 
             let need_to_start_vm = !running_vm_ids.contains(&target_vm_id);
-            let can_start_vm = !self
-                .mutually_exclusive_vm_ids
-                .contains(&target_vm_id)
-                || running_mutually_exclusive_vm_ids.is_empty();
+            let can_start_vm = running_mutually_exclusive_vm_ids.is_empty();
 
             if need_to_start_vm && can_start_vm {
                 self.proxmox_node.start_vm(target_vm_id).await?;
@@ -601,6 +606,22 @@ impl PwpManager {
         }
 
         Ok(())
+    }
+
+    fn is_mutually_exclusive(&self, vm_id: u32) -> bool {
+        self.mutually_exclusive_vm_ids
+            .iter()
+            .any(|group| group.contains(&vm_id))
+    }
+
+    fn conflicting_vm_ids(&self, vm_id: u32) -> BTreeSet<u32> {
+        self.mutually_exclusive_vm_ids
+            .iter()
+            .filter(|group| group.contains(&vm_id))
+            .flatten()
+            .copied()
+            .filter(|other_vm_id| *other_vm_id != vm_id)
+            .collect()
     }
 
     fn format_instant(instant: Instant) -> String {

@@ -7,7 +7,7 @@ pub struct PwpManagerSettings {
     pub trusted_proxy_addresses: Option<Vec<String>>,
 
     #[serde(default)]
-    pub mutually_exclusive_vm_ids: Vec<u32>,
+    pub mutually_exclusive_vm_ids: Vec<Vec<u32>>,
 
     #[serde(default = "default_treat_non_managed_vms_as_mutually_exclusive")]
     pub treat_non_managed_vms_as_mutually_exclusive: bool,
