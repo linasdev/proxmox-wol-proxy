@@ -22,15 +22,20 @@ pub mod active_vm;
 pub mod settings;
 
 #[derive(Clone)]
+pub struct PwpActiveNodeFuture<'f> {
+    pub future: future::Shared<BoxFuture<'f, Result<(), PwpError>>>,
+}
+
+#[derive(Clone)]
 pub struct PwpActiveVmFuture<'f> {
-    pub vm_id: u32,
     pub future: future::Shared<BoxFuture<'f, Result<Arc<PwpOngoingRequestGuard>, PwpError>>>,
 }
 
 pub struct PwpManager {
     proxmox_node: PwpProxmoxNode,
     proxy_targets: Vec<Arc<PwpProxyTarget>>,
-    active_vm_future: Arc<Mutex<Option<PwpActiveVmFuture<'static>>>>,
+    active_node_future: Arc<Mutex<Option<PwpActiveNodeFuture<'static>>>>,
+    active_vm_futures: Arc<Mutex<BTreeMap<u32, PwpActiveVmFuture<'static>>>>,
     active_vms: Arc<Mutex<BTreeMap<u32, PwpActiveVm>>>,
     active_vm_change_notify: Notify,
 
@@ -57,7 +62,8 @@ impl PwpManager {
             .map(PwpProxyTarget::new)
             .map(Arc::new)
             .collect::<Vec<_>>();
-        let active_vm_future = Arc::new(Mutex::new(None));
+        let active_node_future = Arc::new(Mutex::new(None));
+        let active_vm_futures = Arc::new(Mutex::new(BTreeMap::new()));
         let active_vms = Arc::new(Mutex::new(BTreeMap::new()));
         let active_vm_change_notify = Notify::new();
 
@@ -139,7 +145,8 @@ impl PwpManager {
         Ok(Arc::new(Self {
             proxmox_node,
             proxy_targets,
-            active_vm_future,
+            active_node_future,
+            active_vm_futures,
             active_vms,
             active_vm_change_notify,
 
@@ -368,24 +375,30 @@ impl PwpManager {
         let target_vm_id = proxy_target.vm_id();
 
         let active_vm_future = {
-            let mut active_vm_future_guard = self.active_vm_future.lock().await;
+            let mut active_vm_futures_guard = self.active_vm_futures.lock().await;
 
-            active_vm_future_guard
-                .get_or_insert_with(|| self.clone().get_active_vm_future(proxy_target.clone()))
-                .clone()
+            if let Some(active_vm_future) = active_vm_futures_guard.get(&target_vm_id) {
+                active_vm_future.clone()
+            } else {
+                if self.mutually_exclusive_vm_ids.contains(&target_vm_id) {
+                    if let Some(starting_vm_id) = active_vm_futures_guard
+                        .keys()
+                        .find(|vm_id| self.mutually_exclusive_vm_ids.contains(vm_id))
+                    {
+                        info!(
+                            "VM '{target_vm_id}' is required for request but manager is currently starting conflicting VM '{starting_vm_id}'"
+                        );
+                        return Err(PwpError::ProxmoxNodeBusy);
+                    }
+                }
+
+                let active_vm_future = self.clone().get_active_vm_future(proxy_target.clone());
+                active_vm_futures_guard.insert(target_vm_id, active_vm_future.clone());
+                active_vm_future
+            }
         };
 
-        if active_vm_future.vm_id == target_vm_id {
-            let result = active_vm_future.future.await;
-            self.active_vm_future.lock().await.take();
-            result
-        } else {
-            info!(
-                "VM '{target_vm_id}' is required for request but manager is currently starting VM '{}'",
-                active_vm_future.vm_id
-            );
-            Err(PwpError::ProxmoxNodeBusy)
-        }
+        active_vm_future.future.await
     }
 
     fn get_active_vm_future(
@@ -395,6 +408,23 @@ impl PwpManager {
         let target_vm_id = proxy_target.vm_id();
 
         let future = async move {
+            let result = self.clone().start_vm(proxy_target).await;
+            self.active_vm_futures.lock().await.remove(&target_vm_id);
+            result
+        }
+        .boxed()
+        .shared();
+
+        PwpActiveVmFuture { future }
+    }
+
+    async fn start_vm(
+        self: Arc<Self>,
+        proxy_target: Arc<PwpProxyTarget>,
+    ) -> Result<Arc<PwpOngoingRequestGuard>, PwpError> {
+        let target_vm_id = proxy_target.vm_id();
+
+        {
             let ongoing_request_guard =
                 self.active_vms.lock().await.get(&target_vm_id).map(|active_vm| active_vm.handle_request());
 
@@ -403,32 +433,14 @@ impl PwpManager {
                 proxy_target.name()
             );
 
-            let mut running_vm_ids = self.proxmox_node.get_running_vm_ids().await?;
+            self.clone().ensure_active_node().await?;
 
-            if running_vm_ids.is_none() {
-                info!("Proxmox node is not running, will send Wake-on-LAN packet(s) to wake it up");
+            let running_vm_ids = self
+                .proxmox_node
+                .get_running_vm_ids()
+                .await?
+                .ok_or(PwpError::ProxmoxNodeStartTimedOut)?;
 
-                let mut wake_on_lan_sent_count = 0u32;
-                let mut wake_on_lan_interval = interval(self.wake_on_lan_every_duration);
-
-                while running_vm_ids.is_none() {
-                    select! {
-                        _ = wake_on_lan_interval.tick() => {
-                            if wake_on_lan_sent_count >= self.wake_on_lan_attempts {
-                                return Err(PwpError::ProxmoxNodeStartTimedOut);
-                            }
-
-                            self.proxmox_node.send_wake_on_lan().await?;
-                            wake_on_lan_sent_count += 1;
-                        }
-                        _ = sleep(self.reachability_check_delay_duration) => {}
-                    }
-
-                    running_vm_ids = self.proxmox_node.get_running_vm_ids().await?;
-                }
-            }
-
-            let running_vm_ids = running_vm_ids.unwrap();
             let running_mutually_exclusive_vm_ids = running_vm_ids
                 .iter()
                 .copied()
@@ -536,12 +548,59 @@ impl PwpManager {
             }
 
             Ok(ongoing_request_guard)
-        }.boxed().shared();
-
-        PwpActiveVmFuture {
-            vm_id: target_vm_id,
-            future,
         }
+    }
+
+    async fn ensure_active_node(self: Arc<Self>) -> Result<(), PwpError> {
+        let active_node_future = self
+            .active_node_future
+            .lock()
+            .await
+            .get_or_insert_with(|| self.clone().get_active_node_future())
+            .clone();
+
+        active_node_future.future.await
+    }
+
+    fn get_active_node_future(self: Arc<Self>) -> PwpActiveNodeFuture<'static> {
+        let future = async move {
+            let result = self.clone().start_node().await;
+            self.active_node_future.lock().await.take();
+            result
+        }
+            .boxed()
+            .shared();
+
+        PwpActiveNodeFuture { future }
+    }
+
+    async fn start_node(self: Arc<Self>) -> Result<(), PwpError> {
+        let mut running_vm_ids = self.proxmox_node.get_running_vm_ids().await?;
+
+        if running_vm_ids.is_none() {
+            info!("Proxmox node is not running, will send Wake-on-LAN packet(s) to wake it up");
+
+            let mut wake_on_lan_sent_count = 0u32;
+            let mut wake_on_lan_interval = interval(self.wake_on_lan_every_duration);
+
+            while running_vm_ids.is_none() {
+                select! {
+                    _ = wake_on_lan_interval.tick() => {
+                        if wake_on_lan_sent_count >= self.wake_on_lan_attempts {
+                            return Err(PwpError::ProxmoxNodeStartTimedOut);
+                        }
+
+                        self.proxmox_node.send_wake_on_lan().await?;
+                        wake_on_lan_sent_count += 1;
+                    }
+                    _ = sleep(self.reachability_check_delay_duration) => {}
+                }
+
+                running_vm_ids = self.proxmox_node.get_running_vm_ids().await?;
+            }
+        }
+
+        Ok(())
     }
 
     fn format_instant(instant: Instant) -> String {
